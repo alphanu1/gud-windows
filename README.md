@@ -1,57 +1,87 @@
 # gud-windows — WIP
 
-**Nothing here has run on hardware.** This is a scaffold pushed as a backup, not
-a working driver. Read *Status* before trusting any of it.
+**Nothing here has run on hardware.** A scaffold pushed as a backup, not a
+working driver. Read *Status* before trusting any of it.
 
 ---
 
 A Windows host driver for Generic USB Display devices.
 
+## What it is for
+
+**Switchres generates a modeline per game, and that modeline reaches the
+hardware.** The device solves its own PLL for the pixel clock, reconfigures, and
+scans out the timing it was given. Not a resolution picked off a list — the
+actual porches, totals and clock the game wants.
+
+That already works on Linux. Switchres adds the modeline to a DRM connector, the
+in-tree `gud` driver puts it on the wire whole in `SET_STATE_CHECK`, and the
+device retunes. Modes that were never advertised and never compiled into the
+fabric come up on a CRT because the board synthesises the clock for them:
+blitsCRT_Mister reaches PAL 640x576i50 at 12.500 MHz that way, and its solver is
+within 6 ppm across real console and arcade timings.
+
+Windows has no equivalent path, and that is the gap this closes. Same board, no
+firmware change, per-game timings on a 15 kHz CRT from a Windows host.
+
+## Why it needs writing at all
+
 GUD is a wire protocol, not a Linux one. A device implementing it needs the host
 to speak request codes, a mode structure and a buffer format, and nothing about
-the device depends on what is at the other end. This is the other end, for
-Windows.
+the device depends on what is at the other end. So a Windows host driver is a
+peer of the Linux one, not a port of it, and it is useful to any GUD device —
+a Pi Zero adapter, the STM32 reference device, anything answering the protocol.
+The only per-device thing here is the VID:PID in the INF.
 
-The ecosystem is entirely Linux today: the in-tree `gud` driver since 5.13, the
-gadget side, Raspberry Pi images. Every IddCx sample that exists is a *virtual*
-display — it enumerates a monitor and discards the frames — so the frame loop is
-demonstrated and the transport is not. The join between them is what this is.
-
-Nothing here is specific to one device. It should drive a Pi Zero adapter, the
-STM32 reference device, or anything else answering the protocol; the only
-per-device thing is the VID:PID in the INF. It is written against
-[blitsCRT_Mister](https://github.com/alphanu1/blitsCRT_Mister), a 15 kHz FPGA
-video card that presents as a GUD display, and that is what it will be tested
-on. Which is why it carries one thing no other indirect display driver has: the
-modeline store.
-
-## The problem this solves
-
-GUD carries a complete DRM modeline in `SET_STATE_CHECK` — pixel clock, both
-sync starts and ends, both totals, interlace. A device that synthesises its own
-pixel clock needs all of it.
-
-IddCx has nowhere to put any of it. It deals in a monitor mode list and EDID:
-width, height, and a refresh rate as a rational. Porches do not appear anywhere
-in the API, because a normal indirect display does not generate timing and has
-no use for them.
-
-So the driver keeps its own table. Every mode reported to Windows is backed by a
-full modeline, and the lookup runs the other way at commit time: Windows says
-"640x480 at 59.94", the table says which modeline that was, and that modeline
-goes on the wire intact. Two sources fill it — the device's own advertised list,
-which works with no configuration at all, and an INI a user or a Switchres
-backend writes.
-
-Making the driver the *sink* rather than a scavenger is deliberate. There is
-nowhere a Windows Switchres deposits a modeline to be read: `adl` and
-`powerstrip` push timing into a graphics driver through a vendor interface and
-leave nothing behind. A backend that writes to a known destination is the shape
-`drmkms` already has.
+Nothing like it exists. The GUD ecosystem is entirely Linux: the in-tree driver
+since 5.13, the gadget side, Raspberry Pi images. Every IddCx sample is a
+*virtual* display — it enumerates a monitor and discards the frames — so the
+frame loop is demonstrated and the transport is not.
 
 Screen capture through the Desktop Duplication API would be a fraction of the
 work and is not an option: it cannot switch resolution per game, which is the
-point of the whole design.
+whole point.
+
+## How a modeline gets to the device
+
+This is the one hard problem, and it is the reason the driver carries something
+no other indirect display driver has.
+
+IddCx has nowhere to put a modeline. Its vocabulary is a monitor mode list and
+EDID: width, height, and a refresh rate as a rational. Porches do not appear
+anywhere in the API, because a normal indirect display does not generate timing
+and has no use for them. This one does.
+
+So the driver keeps its own table, and every mode it reports to Windows is
+backed by a full modeline. At commit time the lookup runs the other way: Windows
+says "640x480 at 59.94", the table says which modeline that was, and that
+modeline goes on the wire intact — clock, both sync starts and ends, both
+totals, interlace. The device sees exactly what it would have seen from Linux.
+
+Two sources fill the table:
+
+1. **The device's own advertised list**, from `GET_CONNECTOR_MODES`. Every GUD
+   device has one and every entry carries full timing, so the driver works with
+   no configuration at all — plug the board in and the modes it advertises are
+   the modes Windows offers.
+
+2. **A modeline store**, `C:\ProgramData\gud-windows\modelines.ini`, in the
+   X11 and Switchres spelling. Loaded second, so a hand-written entry overrides
+   an advertised one with the same geometry and rate. This is where a Switchres
+   backend deposits generated modelines.
+
+The driver is the *sink*, not a scavenger, and that is deliberate. There is
+nowhere a Windows Switchres leaves a modeline to be found: the existing backends
+`adl` and `powerstrip` push timing into a graphics driver through a vendor
+interface and leave nothing behind. Writing to a known destination is the shape
+`drmkms` already has, so the backend is small.
+
+The lookup key is exact — pixel clock, both totals, active size, interlace — not
+a refresh-rate match. `DISPLAYCONFIG_VIDEO_SIGNAL_INFO` hands those numbers
+straight back because the driver put them there. Matching on refresh alone
+cannot separate 59.94 from 60.00 with any tolerance wide enough to survive
+Windows' rounding, and returning the wrong modeline puts wrong timing on a
+fixed-frequency deflection circuit.
 
 ---
 
@@ -103,21 +133,30 @@ multi-character pool tag, and a misspelled field. None would have been found by
 reading it.
 
 The stubs are guesses. The three structures most likely to differ are named at
-the top of `tests/wdkstub/IddCx.h`, and the one field access that depends on it
-is isolated in `SignalInfo()` so there is a single line to correct. Same for the
-two version-specific lines in `GudDisplay.inf` — `UmdfExtensions` and
+the top of `tests/wdkstub/IddCx.h`, and the one field access that depends on
+them is isolated in `SignalInfo()` so there is a single line to correct. Same
+for the two version-specific lines in `GudDisplay.inf` — `UmdfExtensions` and
 `UmdfLibraryVersion` — which must be copied from the `IndirectDisplay` sample
 that ships with the WDK.
 
 ### Compiled and linked — `gudprobe.exe`
 
 Cross-compiles and links for x86-64 Windows against Microsoft's real
-`winusb.lib` and `setupapi.lib`. Never run on a machine with a device attached.
+`winusb.lib` and `setupapi.lib`. Never run with a device attached.
 
 **`gudprobe` is not a driver.** It talks to the device directly over WinUSB.
 Nothing appears in Display Settings; Windows does not know a display exists. It
-prints the mode list, sets a mode, and puts a picture on the CRT. That is the
-whole point — it proves the wire without IddCx in the way.
+prints the mode list, sets a mode — including an arbitrary modeline off the
+command line — and puts a picture on the CRT. That is the point: it proves the
+wire, and the modeline path, without IddCx in the way.
+
+```
+gudprobe --modeline "7.560 384 400 432 480 224 227 230 262 -hsync -vsync"
+```
+
+That timing is in no advertised list. The device solves the PLL for 7.560 MHz
+and scans it out. Proving that from the command line is worth doing before any
+of the driver exists.
 
 ### Tested — everything above the transport
 
@@ -149,29 +188,24 @@ expand rather than corrupt, so the caller can notice and send raw.
 `gud_transport` straight into `blitscrt_handle_ctrl`. Both protocol
 implementations are under test at once, so a disagreement about structure
 layout, request codes or the status handshake shows up there rather than on a
-CRT.
+CRT. Among other things it sets an unadvertised 384x224p60 modeline and checks
+the device accepts it, and sets a 1080p60 one and checks the device refuses it.
 
-It has earned its keep several times over. It caught a lookup key that could not
+It has earned its keep several times over: it caught a lookup key that could not
 separate 59.94 from 60.00, a `vSyncFreq` missing its interlace doubling (which
 would have reported 480i to Windows as 30 Hz), an out-of-band test modeline the
 device correctly refused, and an INI key/value split that rejected every line in
 the example file.
 
-The Windows cross-checks found the rest:
-
 ```
 make windows        # cross-compile gudprobe.exe, compile the driver
+make golden         # regenerate docs/expected-gudprobe-output.txt
 ```
 
-Both need mingw-w64. `make probe` links the real thing; `make syntax` compiles
-the driver against the stubs. Worth keeping green as a pre-flight — it is fast
+`make windows` needs mingw-w64. Worth keeping green as a pre-flight — it is fast
 and it catches the mechanical class, including two that would have failed on
 MSVC and nowhere else: `strncasecmp` (POSIX, 12 call sites, absent from MSVC)
 and a static-assert fallback that declared the same typedef six times.
-
-```
-make golden         # regenerate docs/expected-gudprobe-output.txt
-```
 
 `docs/expected-gudprobe-output.txt` is what `gudprobe` should print against
 blitsCRT_Mister, generated by the probe tool's own dump code run against the
@@ -186,7 +220,7 @@ the finding.
 include/
   gud.h              the protocol. MIT, from Noralf Tronnes' include/drm/gud.h
   gud_host.h         host side, with no USB in it
-  modeline.h         the store: where porches come from
+  modeline.h         the store: how a modeline reaches the device
   convert.h          BGRA8888 to the wire formats
   lz4enc.h           LZ4 block compression
   gud_dump.h         render a probed device as text
@@ -218,14 +252,15 @@ The driver needs the WDK and the two version lines in `GudDisplay.inf` fixed.
 
 ## Next, in order
 
-`docs/BRINGUP.md` has the detail. The short version:
+`docs/BRINGUP.md` has the detail.
 
 1. Bind WinUSB — `GudProbeWinUsb.inf` or Zadig. The gadget declares a
    vendor-class interface with no Microsoft OS descriptors, so Windows leaves it
    with no function driver.
 2. `gudprobe` — enumerate, diff against the expected output.
-3. `gudprobe --testcard`, then `--bounce`. **At the end of this the whole wire
-   is proved** and anything afterwards is IddCx. Worth a day.
+3. `gudprobe --testcard`, then `--modeline`, then `--bounce`. **At the end of
+   this the whole wire is proved**, including an arbitrary modeline reaching the
+   device, and anything afterwards is IddCx. Worth a day.
 4. Settle the structural question: will IddCx attach to a PDO it did not create,
    rather than the root-enumerated software device every sample uses? Microsoft
    names this exact case — a USB dongle with a monitor attached — but if it does
@@ -234,12 +269,12 @@ The driver needs the WDK and the two version lines in `GudDisplay.inf` fixed.
    driver that enumerates a monitor and throws frames away. No USB in it.
 5. Fix the three bugs above against the real headers and sample.
 6. First frame.
-7. Modelines from an INI, then a Switchres backend.
+7. A Switchres backend writing into the modeline store.
 
 Worth doing on the device side at some point: Microsoft OS 2.0 descriptors on
 the gadget remove step 1 entirely. Windows binds WinUSB from a WCID descriptor
 with nothing to install, which is the difference between a board that works when
-plugged in and one that needs a driver first.
+plugged in and one that needs a driver installed first.
 
 ## Licensing
 
