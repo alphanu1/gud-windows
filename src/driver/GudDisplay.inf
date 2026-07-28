@@ -1,0 +1,92 @@
+; SPDX-License-Identifier: MIT
+;
+; GudDisplay.inf -- IddCx driver for a Generic USB Display device.
+;
+; This installs under the Display setup class onto a USB PDO. That combination
+; looks odd and is correct: the setup class describes what the device is to the
+; user, not how it is enumerated, and it is how every USB display adapter is
+; installed. Installing it under USBDevice instead gets a driver that loads and
+; a monitor that never appears in Display Settings.
+;
+; UmdfDispatcher = WinUsb is the line that matters. It puts winusb.sys
+; underneath the UMDF host, which is what makes WdfUsbTargetDeviceCreate work
+; from a user-mode driver. Without it the driver loads and every USB call
+; fails.
+;
+; Two values below must be checked against the WDK actually installed, because
+; both are version-specific and a wrong one fails at install time with a
+; message that does not name the cause:
+;
+;   UmdfExtensions      the IddCx version, e.g. IddCx0102, IddCx0104, IddCx0105
+;   UmdfLibraryVersion  the UMDF2 version shipped with that WDK
+;
+; `certutil -dump` the WDK's IddCx redist, or copy both lines from the
+; IndirectDisplay sample INF that ships with the WDK, which is guaranteed to
+; match its own headers.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Display
+ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider    = %Provider%
+CatalogFile = GudDisplay.cat
+DriverVer   =
+PnpLockdown = 1
+
+[Manufacturer]
+%Provider% = Devices, NTamd64, NTarm64
+
+[Devices.NTamd64]
+%DeviceName% = GudDisplay_Install, USB\VID_1D50&PID_614D
+%DeviceName% = GudDisplay_Install, USB\VID_1D50&PID_614D&MI_00
+
+[Devices.NTarm64]
+%DeviceName% = GudDisplay_Install, USB\VID_1D50&PID_614D
+%DeviceName% = GudDisplay_Install, USB\VID_1D50&PID_614D&MI_00
+
+; The &MI_00 form is there for the day the gadget grows a second function and
+; Windows puts usbccgp in front of it. With one interface today only the first
+; matches, and listing both costs nothing.
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+GudDisplay.dll = 1
+
+[DestinationDirs]
+UMDriverCopy = 13
+
+[GudDisplay_Install.NT]
+CopyFiles = UMDriverCopy
+Include   = WUDFRD.inf
+Needs     = WUDFRD.NT
+
+[GudDisplay_Install.NT.hw]
+Include = WUDFRD.inf
+Needs   = WUDFRD.NT.HW
+
+[GudDisplay_Install.NT.Services]
+Include = WUDFRD.inf
+Needs   = WUDFRD.NT.Services
+
+[GudDisplay_Install.NT.Wdf]
+UmdfService              = GudDisplay, GudDisplay_Install_Service
+UmdfServiceOrder         = GudDisplay
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfFileObjectPolicy     = AllowNullAndUnknownFileObjects
+UmdfDeviceObjectPolicy   = AllowNullAndUnknownFileObjects
+
+[GudDisplay_Install_Service]
+UmdfLibraryVersion = 2.33.0
+ServiceBinary      = %13%\GudDisplay.dll
+UmdfExtensions     = IddCx0102
+UmdfDispatcher     = WinUsb
+
+[UMDriverCopy]
+GudDisplay.dll
+
+[Strings]
+Provider   = "gud-windows"
+DeviceName = "Generic USB Display"
+DiskName   = "GUD Display Installation Disk"

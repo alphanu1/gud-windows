@@ -1,0 +1,48 @@
+; SPDX-License-Identifier: MIT
+;
+; GudProbeWinUsb.inf -- bind stock winusb.sys, so gudprobe.exe can open the
+; device. Bring-up only. Installing GudDisplay.inf later replaces this binding.
+;
+; This is needed because the gadget declares a vendor-class interface and no
+; Microsoft OS descriptors, so Windows has nothing to match and leaves the
+; device with no function driver. Zadig does the same job interactively; this
+; file is here so the step is reproducible and does not depend on a tool.
+;
+; The device interface GUID below is this project's own. Generate a fresh one
+; if you fork this, or two unrelated devices will answer the same enumeration.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = USBDevice
+ClassGuid   = {88BAE032-5A81-49f0-BC3D-A4FF138216D6}
+Provider    = %Provider%
+CatalogFile = GudProbeWinUsb.cat
+DriverVer   =
+PnpLockdown = 1
+
+[Manufacturer]
+%Provider% = Devices, NTamd64, NTarm64
+
+[Devices.NTamd64]
+%DeviceName% = USB_Install, USB\VID_1D50&PID_614D
+
+[Devices.NTarm64]
+%DeviceName% = USB_Install, USB\VID_1D50&PID_614D
+
+[USB_Install]
+Include = winusb.inf
+Needs   = WINUSB.NT
+
+[USB_Install.Services]
+Include = winusb.inf
+Needs   = WINUSB.NT.Services
+
+[USB_Install.HW]
+AddReg = Dev_AddReg
+
+[Dev_AddReg]
+HKR,,DeviceInterfaceGUIDs,0x10000,"{6f8a1c1e-3d2b-4a7f-9c55-2b7e0d41a9f3}"
+
+[Strings]
+Provider   = "gud-windows"
+DeviceName = "GUD display (WinUSB, bring-up)"
