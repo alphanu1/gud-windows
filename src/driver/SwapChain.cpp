@@ -257,11 +257,19 @@ bool SwapChainProcessor::SendRect(ID3D11Texture2D* staging, const RECT& r)
     // arrangement gud_flush_rect() requires: getting it backwards produces a
     // picture whose stride drifts across every line, and that looks like a
     // timing fault rather than a copy fault.
-    convert_rect(m_dev->format,
-                 static_cast<const uint8_t*>(map.pData), map.RowPitch,
-                 m_conv.data(), x, y, w, h);
+    //
+    // The return value is checked. Ignoring it sends whatever m_conv happened
+    // to hold -- uninitialised on the first frame -- and a device that cannot
+    // be converted to would be fed a whole surface of garbage at 60 Hz rather
+    // than failing once. gudprobe has always checked this; the driver did not.
+    int cerr = convert_rect(m_dev->format,
+                            static_cast<const uint8_t*>(map.pData), map.RowPitch,
+                            m_conv.data(), x, y, w, h);
 
     m_d3dContext->Unmap(staging, 0);
+
+    if (cerr < 0)
+        return false;
 
     size_t comp = 0;
     if (m_dev->compress)

@@ -292,6 +292,71 @@ static void t_flush(void)
     }
 }
 
+/*
+ * gud_format_bpp() and convert_rect() must agree about which formats exist.
+ *
+ * They did not. bpp claimed R8 and ARGB8888 at 1 and 4 bytes while convert_rect
+ * had no case for either, so gud_set_state() would accept a device offering
+ * only R8 -- has_format passes, bpp is non-zero -- and then every frame would
+ * fail to convert. In the driver that failed silently, because SwapChain.cpp
+ * ignored the return and sent the buffer anyway.
+ *
+ * Sweeping every code rather than testing the two that were wrong: the bug was
+ * the two functions drifting apart, so the invariant is what needs a test, not
+ * the instances of it.
+ */
+static void t_format_table_agrees(void)
+{
+    static const uint8_t codes[] = {
+        GUD_PIXEL_FORMAT_R1,     GUD_PIXEL_FORMAT_R8,
+        GUD_PIXEL_FORMAT_XRGB1111, GUD_PIXEL_FORMAT_RGB332,
+        GUD_PIXEL_FORMAT_RGB565, GUD_PIXEL_FORMAT_RGB888,
+        GUD_PIXEL_FORMAT_XRGB8888, GUD_PIXEL_FORMAT_ARGB8888,
+    };
+    /* small, so 4 bytes per pixel still fits with room to spare */
+    enum { W = 8, H = 8 };
+    static uint8_t src[W * H * 4];
+    static uint8_t dst[W * H * 4 + 16];
+    unsigned i;
+
+    for (i = 0; i < sizeof src; i++)
+        src[i] = (uint8_t)(i * 11);
+
+    for (i = 0; i < sizeof codes; i++) {
+        unsigned bpp = gud_format_bpp(codes[i]);
+        int cr = convert_rect(codes[i], src, W * 4, dst, 0, 0, W, H);
+
+        if (bpp)
+            CHECK(cr == 0,
+                  "format 0x%02x: gud_format_bpp says %u bytes but "
+                  "convert_rect cannot produce it", codes[i], bpp);
+        else
+            CHECK(cr < 0,
+                  "format 0x%02x: convert_rect produced a format "
+                  "gud_format_bpp refuses", codes[i]);
+    }
+}
+
+/* R8 is luma, not a channel average: a saturated blue and a saturated green
+ * must not land on the same grey. */
+static void t_r8_is_luma(void)
+{
+    uint8_t px[2 * 4];
+    uint8_t out[2];
+
+    px[0] = 0xff; px[1] = 0x00; px[2] = 0x00; px[3] = 0xff;   /* pure blue  */
+    px[4] = 0x00; px[5] = 0xff; px[6] = 0x00; px[7] = 0xff;   /* pure green */
+
+    convert_rect(GUD_PIXEL_FORMAT_R8, px, sizeof px, out, 0, 0, 2, 1);
+
+    CHECK(out[0] != out[1],
+          "blue and green both became 0x%02x -- that is an average, not luma",
+          out[0]);
+    CHECK(out[1] > out[0],
+          "green (0x%02x) should be brighter than blue (0x%02x)",
+          out[1], out[0]);
+}
+
 static void t_status_handshake(void)
 {
     unsigned before = L.n_status;
@@ -487,6 +552,8 @@ int main(void)
     t_modes();               printf("  advertised modes\n");
     t_modeset();             printf("  modeset, unadvertised and refused\n");
     t_flush();               printf("  flush: raw, LZ4, damage, bad input\n");
+    t_format_table_agrees(); printf("  format table: bpp and convert agree\n");
+    t_r8_is_luma();          printf("  R8 is luma\n");
     t_status_handshake();    printf("  STATUS_ON_SET handshake\n");
     t_modeline_roundtrip();  printf("  modeline store\n");
     t_ini();                 printf("  ini parsing and override\n");

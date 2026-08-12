@@ -93,7 +93,10 @@ void convert_bgra_to_rgb888(const uint8_t *src, size_t src_pitch,
     }
 }
 
-/* XRGB8888: the source layout unchanged, so this is a strided memcpy. */
+/* XRGB8888: the source layout unchanged, so this is a strided memcpy. Also
+ * serves ARGB8888 -- both are B,G,R,? in memory little-endian and differ only
+ * in whether the fourth byte means anything, which is the device's business
+ * and not this function's. */
 void convert_bgra_to_xrgb8888(const uint8_t *src, size_t src_pitch,
                               uint8_t *dst,
                               uint32_t x, uint32_t y, uint32_t w, uint32_t h)
@@ -104,6 +107,33 @@ void convert_bgra_to_xrgb8888(const uint8_t *src, size_t src_pitch,
         memcpy(dst + (size_t)row * w * 4,
                src + (size_t)(y + row) * src_pitch + (size_t)x * 4,
                (size_t)w * 4);
+}
+
+/*
+ * R8: eight-bit greyscale, one byte.
+ *
+ * Rec.601 luma rather than a channel average, because an average sends a
+ * saturated blue and a saturated green to the same grey and the eye does not
+ * agree. Integer weights summing to 256 so the shift is exact.
+ *
+ * Truncating, like RGB565 above and for the same reason: a rounding term
+ * shifts the whole ramp by half a step and lifts black off the floor.
+ */
+void convert_bgra_to_r8(const uint8_t *src, size_t src_pitch,
+                        uint8_t *dst,
+                        uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    uint32_t row, col;
+
+    for (row = 0; row < h; row++) {
+        const uint8_t *s = src + (size_t)(y + row) * src_pitch + (size_t)x * 4;
+        uint8_t *d = dst + (size_t)row * w;
+
+        for (col = 0; col < w; col++, s += 4, d++)
+            *d = (uint8_t)(((uint32_t)s[2] * 77 +
+                            (uint32_t)s[1] * 150 +
+                            (uint32_t)s[0] * 29) >> 8);
+    }
 }
 
 int convert_rect(uint8_t format,
@@ -118,8 +148,15 @@ int convert_rect(uint8_t format,
     case GUD_PIXEL_FORMAT_RGB888:
         convert_bgra_to_rgb888(src, src_pitch, dst, x, y, w, h);   return 0;
     case GUD_PIXEL_FORMAT_XRGB8888:
+    case GUD_PIXEL_FORMAT_ARGB8888:
         convert_bgra_to_xrgb8888(src, src_pitch, dst, x, y, w, h); return 0;
+    case GUD_PIXEL_FORMAT_R8:
+        convert_bgra_to_r8(src, src_pitch, dst, x, y, w, h);       return 0;
     default:
+        /* Must stay in step with gud_format_bpp(): a format that reports a
+         * byte count there and cannot be produced here is worse than one
+         * refused in both places, because gud_set_state() will have already
+         * accepted the mode by the time this fails. */
         return -1;
     }
 }
