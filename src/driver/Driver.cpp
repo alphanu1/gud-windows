@@ -248,7 +248,7 @@ _Use_decl_annotations_
 static NTSTATUS EvtIddCxAdapterInitFinished(
     IDDCX_ADAPTER adapter, const IDARG_IN_ADAPTER_INIT_FINISHED* args)
 {
-    auto* ctx = DeviceGetContext(WdfObjectContextGetObject(adapter));
+    auto* ctx = AdapterGetContext(adapter)->Device;
     if (!NT_SUCCESS(args->AdapterInitStatus))
         return args->AdapterInitStatus;
 
@@ -276,13 +276,21 @@ static NTSTATUS EvtIddCxAdapterInitFinished(
     info.MonitorDescription.DataSize = 0;
     info.MonitorDescription.pData = nullptr;
 
+    // The monitor gets its own context carrying the same back-pointer, so the
+    // monitor callbacks can reach the device without guessing.
+    WDF_OBJECT_ATTRIBUTES monAttrs;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&monAttrs, MonitorContext);
+
     IDARG_IN_MONITORCREATE create{};
-    create.pMonitorInfo = &info;
+    create.pMonitorInfo     = &info;
+    create.ObjectAttributes = &monAttrs;
+
     IDARG_OUT_MONITORCREATE created{};
     NTSTATUS status = IddCxMonitorCreate(adapter, &create, &created);
     if (!NT_SUCCESS(status))
         return status;
 
+    MonitorGetContext(created.MonitorObject)->Device = ctx;
     ctx->Monitor = created.MonitorObject;
 
     IDARG_OUT_MONITORARRIVAL arrival{};
@@ -297,7 +305,7 @@ static NTSTATUS EvtIddCxMonitorGetDefaultModes(
     const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* in,
     IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* out)
 {
-    auto* ctx = DeviceGetContext(WdfObjectContextGetObject(monitor));
+    auto* ctx = MonitorGetContext(monitor)->Device;
 
     if (in->DefaultMonitorModeBufferInputCount == 0) {
         out->DefaultMonitorModeBufferOutputCount = ctx->Modes.n;
@@ -321,7 +329,7 @@ static NTSTATUS EvtIddCxMonitorQueryModes(
     const IDARG_IN_QUERYTARGETMODES* in,
     IDARG_OUT_QUERYTARGETMODES* out)
 {
-    auto* ctx = DeviceGetContext(WdfObjectContextGetObject(monitor));
+    auto* ctx = MonitorGetContext(monitor)->Device;
 
     if (in->TargetModeBufferInputCount == 0) {
         out->TargetModeBufferOutputCount = ctx->Modes.n;
@@ -339,7 +347,7 @@ _Use_decl_annotations_
 static NTSTATUS EvtIddCxAdapterCommitModes(
     IDDCX_ADAPTER adapter, const IDARG_IN_COMMITMODES* in)
 {
-    auto* ctx = DeviceGetContext(WdfObjectContextGetObject(adapter));
+    auto* ctx = AdapterGetContext(adapter)->Device;
 
     for (UINT i = 0; i < in->PathCount; i++) {
         const IDDCX_PATH& path = in->pPaths[i];
@@ -410,7 +418,7 @@ _Use_decl_annotations_
 static NTSTATUS EvtIddCxMonitorAssignSwapChain(
     IDDCX_MONITOR monitor, const IDARG_IN_SETSWAPCHAIN* in)
 {
-    auto* ctx = DeviceGetContext(WdfObjectContextGetObject(monitor));
+    auto* ctx = MonitorGetContext(monitor)->Device;
 
     ctx->Processor.reset();
     if (!ctx->Gud.active_valid)
@@ -425,7 +433,7 @@ static NTSTATUS EvtIddCxMonitorAssignSwapChain(
 _Use_decl_annotations_
 static NTSTATUS EvtIddCxMonitorUnassignSwapChain(IDDCX_MONITOR monitor)
 {
-    DeviceGetContext(WdfObjectContextGetObject(monitor))->Processor.reset();
+    MonitorGetContext(monitor)->Device->Processor.reset();
     return STATUS_SUCCESS;
 }
 
@@ -462,6 +470,13 @@ static NTSTATUS EvtDeviceD0Entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE)
     if (!NT_SUCCESS(status))
         return status;
 
+    // Guard against a second adapter on resume. EvtDeviceD0Entry fires on
+    // every power transition, and IddCxAdapterInitAsync is not idempotent.
+    // The IndirectDisplay sample initialises here too, so the placement is
+    // kept and the re-entry is refused instead.
+    if (ctx->Adapter)
+        return STATUS_SUCCESS;
+
     IDARG_IN_ADAPTER_INIT init{};
     init.WdfDevice = device;
     init.pCaps = nullptr;   // see below
@@ -477,13 +492,29 @@ static NTSTATUS EvtDeviceD0Entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE)
     caps.EndPointDiagnostics.pEndPointManufacturerName = L"Generic USB Display";
     init.pCaps = &caps;
 
+    // The adapter carries a back-pointer to us, so EvtIddCxAdapterInitFinished
+    // and EvtIddCxAdapterCommitModes can find the device context.
+    WDF_OBJECT_ATTRIBUTES adapterAttrs;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&adapterAttrs, AdapterContext);
+    init.ObjectAttributes = &adapterAttrs;
+
     IDARG_OUT_ADAPTER_INIT out{};
     status = IddCxAdapterInitAsync(&init, &out);
     if (!NT_SUCCESS(status))
         return status;
 
+    AdapterGetContext(out.AdapterObject)->Device = ctx;
     ctx->Adapter = out.AdapterObject;
     return STATUS_SUCCESS;
+}
+
+// Runs when the WDFDEVICE is being torn down. Destroys what the placement-new
+// in EvtDriverDeviceAdd constructed, which is what joins the frame thread.
+static void EvtDeviceContextCleanup(WDFOBJECT object)
+{
+    auto* ctx = DeviceGetContext(static_cast<WDFDEVICE>(object));
+    if (ctx)
+        ctx->~DeviceContext();
 }
 
 _Use_decl_annotations_
@@ -514,6 +545,11 @@ static NTSTATUS EvtDriverDeviceAdd(WDFDRIVER, PWDFDEVICE_INIT deviceInit)
 
     WDF_OBJECT_ATTRIBUTES attrs;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attrs, DeviceContext);
+    // The context is placement-newed below, so something has to destroy it.
+    // Without this ~DeviceContext never runs, so ~SwapChainProcessor never
+    // runs, so the frame thread is never woken or joined -- a wedged thread in
+    // Session 0 on every unplug, which is the failure BRINGUP warns about.
+    attrs.EvtCleanupCallback = EvtDeviceContextCleanup;
 
     WDFDEVICE device = nullptr;
     status = WdfDeviceCreate(&deviceInit, &attrs, &device);

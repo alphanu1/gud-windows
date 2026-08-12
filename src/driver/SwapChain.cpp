@@ -179,7 +179,17 @@ void SwapChainProcessor::RunCore()
             std::vector<RECT> rects;
             const auto& md = buffer.MetaData;
 
-            if (md.DirtyRectCount == 0 && md.MoveRegionCount == 0) {
+            if (kFullFrameOnly) {
+                // Proof-of-concept path: send the whole surface every frame
+                // and do no rect arithmetic at all. Affordable because it was
+                // measured on this hardware -- a full compressed 648x480
+                // surface is 1.6 ms against a 16.7 ms field, about a tenth of
+                // the budget. Wasteful, not ruinous, and it removes every way
+                // the damage path can be subtly wrong while the rest of the
+                // driver is being proved. Turn this off to get the real one.
+                RECT full{ 0, 0, (LONG)m_mode.hdisplay, (LONG)m_mode.vdisplay };
+                rects.push_back(full);
+            } else if (md.DirtyRectCount == 0 && md.MoveRegionCount == 0) {
                 // No damage at all means the whole surface, which is what the
                 // first frame after a modeset always is.
                 RECT full{ 0, 0, (LONG)m_mode.hdisplay, (LONG)m_mode.vdisplay };

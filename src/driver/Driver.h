@@ -120,6 +120,15 @@ private:
     // change -- is cheaper. 32 is a starting number, not a measured one.
     static constexpr size_t kMaxRects = 32;
 
+    // Send the whole surface every frame and skip damage entirely.
+    //
+    // For bring-up. A full compressed 648x480 surface measured 1.6 ms on this
+    // hardware against a 16.7 ms field, so this costs about a tenth of the
+    // budget and nothing else -- cheap enough to prove the driver with, and it
+    // takes every rect-arithmetic fault off the table while the IddCx side is
+    // still unproven. The damage path is written and sits behind this.
+    static constexpr bool kFullFrameOnly = true;
+
     IDDCX_SWAPCHAIN m_swapChain;
     LUID            m_renderAdapter;
     HANDLE          m_newFrameEvent;
@@ -167,6 +176,33 @@ struct DeviceContext {
 };
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DeviceContext, DeviceGetContext);
+
+// ---------------------------------------------------------------------------
+// Back-pointers from the IddCx objects to the device context.
+//
+// A callback is handed an IDDCX_ADAPTER or an IDDCX_MONITOR and has to get
+// from there to our own state. The way that reads naturally --
+// DeviceGetContext(WdfObjectContextGetObject(adapter)) -- is wrong and was
+// what this driver did: WdfObjectContextGetObject takes a *context pointer*
+// and returns the object owning it, so feeding it a handle and expecting a
+// WDFDEVICE back has no valid path. It typechecks because every WDF handle is
+// a void* typedef, and it would have dereferenced garbage in every callback.
+//
+// The correct pattern, which the IndirectDisplay sample uses: give the adapter
+// and the monitor their own WDF contexts holding a back-pointer, attached
+// through the ObjectAttributes field of IDARG_IN_ADAPTER_INIT and
+// IDARG_IN_MONITORCREATE.
+// ---------------------------------------------------------------------------
+
+struct AdapterContext {
+    DeviceContext* Device;
+};
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(AdapterContext, AdapterGetContext);
+
+struct MonitorContext {
+    DeviceContext* Device;
+};
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(MonitorContext, MonitorGetContext);
 
 // Reload the modeline store from the device list plus the on-disk INI, and
 // tell IddCx the monitor's mode list changed. Called at start and whenever the
