@@ -25,7 +25,7 @@
  *   1. The device's own list, from GET_CONNECTOR_MODES. Every GUD device
  *      advertises one and every entry in it carries full timing. This is why
  *      the driver works with no configuration at all: plug the board in and
- *      the four modes it advertises are the four Windows offers.
+ *      the modes it advertises are the modes Windows offers.
  *
  *   2. A modeline store the user writes -- an INI on disk today, and the sink
  *      a Switchres backend pushes into later. Entries here override the
@@ -39,6 +39,13 @@
  * this driver the sink rather than a scavenger means the Switchres side is a
  * small backend that writes modelines to a known destination, which is the
  * shape every other Switchres backend already has.
+ *
+ * None of which is needed by every GUD device, and the above reads narrower
+ * than it is. A device with a fixed panel advertises a mode list that is the
+ * whole truth, and the store is then a cache of it: filled from source 1, never
+ * overridden, source 2 absent. It exists because some devices synthesise their
+ * own pixel clock and can be handed timing that was never advertised. It cannot
+ * invent a mode the device did not agree to -- SET_STATE_CHECK still arbitrates.
  */
 #ifndef MODELINE_H
 #define MODELINE_H

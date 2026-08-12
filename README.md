@@ -29,9 +29,27 @@ firmware change, per-game timings on a 15 kHz CRT from a Windows host.
 GUD is a wire protocol, not a Linux one. A device implementing it needs the host
 to speak request codes, a mode structure and a buffer format, and nothing about
 the device depends on what is at the other end. So a Windows host driver is a
-peer of the Linux one, not a port of it, and it is useful to any GUD device —
-a Pi Zero adapter, the STM32 reference device, anything answering the protocol.
-The only per-device thing here is the VID:PID in the INF.
+peer of the Linux one, not a port of it, and it is a driver for *any* GUD
+device — a Pi Zero adapter, the STM32 reference device, anything answering the
+protocol.
+
+Switchres is the motivating case and not the scope. Everything above the
+transport asks the device instead of assuming: `GET_FORMATS` picks the pixel
+format, `GET_CONNECTOR_MODES` fills the mode list, the descriptor bounds are
+checked, and `FULL_UPDATE` and `STATUS_ON_SET` are both honoured. A device with a
+fixed panel and a sensible advertised list needs no configuration and never
+touches the modeline store — plug it in and its modes are the modes Windows
+offers. The store exists because some devices synthesise their own timing, not
+because this one does.
+
+What is left that is device-specific is the VID:PID in both INFs and in
+`gudprobe.c`, and a format preference tuned to a six-bit DAC. `docs/DESIGN.md`
+has the list and keeps it short deliberately.
+
+No EDID is sent, to any device, and that one is not going to move. An EDID
+carries a mode list the store knows nothing about, and the commit path refuses
+modes it has no modeline for — the safety net working. If some device turns out
+to need one it is a runtime option, not a new default.
 
 Nothing like it exists. The GUD ecosystem is entirely Linux: the in-tree driver
 since 5.13, the gadget side, Raspberry Pi images. Every IddCx sample is a

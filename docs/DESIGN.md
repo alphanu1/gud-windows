@@ -1,5 +1,54 @@
 # Design
 
+## One driver, any GUD device
+
+GUD is a wire protocol, not a Linux one. A device implementing it needs a host
+that speaks request codes, a mode structure and a buffer format, and nothing
+about the device depends on what is at the other end. This is a peer of the
+in-tree Linux driver, not a port of it, and it drives anything that answers the
+protocol — a Pi Zero adapter, the STM32 reference device, an e-paper panel.
+
+Switchres, 15 kHz CRTs and per-game modelines are why it got written. They are
+not what it is limited to, and that is structural: everything above
+`struct gud_transport` asks the device instead of assuming. `GET_FORMATS`
+decides the pixel format. `GET_CONNECTOR_MODES` fills the mode list. The
+descriptor's width and height bounds are checked before anything uses them, a
+`FULL_UPDATE` device gets whole frames and no per-rect `SET_BUFFER`, and a
+`STATUS_ON_SET` device has its errors read.
+
+**The modeline store is additive.** For a device whose advertised list is the
+whole truth it is a cache of `GET_CONNECTOR_MODES` and nothing else — INI absent,
+no override ever taken. It exists because some devices synthesise their own pixel
+clock and can be handed timing that was never advertised, and it cannot invent a
+mode the device did not agree to: `SET_STATE_CHECK` still arbitrates.
+
+### What is device-specific
+
+**`VID_1D50&PID_614D`**, in both INFs and as `VID`/`PID` in `gudprobe.c`. The one
+thing another device must change, and the probe tool wants a `--device vid:pid`
+argument so it does not need a rebuild for the next one.
+
+**RGB565 ahead of anything deeper**, in `Driver.h`. Right for a six-bit resistor
+ladder, a pointless loss on a device offering `XRGB8888`.
+
+**Negative sync polarity** when a hand-written modeline omits it, in
+`modeline_parse()`. The 15 kHz RGB and SCART convention. Advertised modes carry
+their own flags and never reach it.
+
+**No EDID**, for every device and not only this one. `GUD_REQ_GET_CONNECTOR_EDID`
+is never issued. A decision and not a gap: an EDID carries a mode list the store
+knows nothing about and the commit path refuses those modes. See below.
+
+**Connector type reported as VGA.** `MonitorType` in `IDDCX_MONITOR_INFO`
+describes the link between adapter and monitor, and over USB there is no such
+connector. `DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HD15` describes the only hop that has
+one — the analog output into the CRT. Mapping GUD's `connector_type` across buys
+nothing: the value is cosmetic and a device with an HDMI socket is still reached
+over USB. `gud_probe()` reads the field anyway, because `gudprobe` prints it.
+
+`R1` and `XRGB1111` are refused outright, which is a real limit and not a tuned
+default. See *What is not here*.
+
 ## One package, not two
 
 The driver binds directly to the USB device: a UMDF2 driver on
@@ -184,6 +233,30 @@ If a name turns out to be needed, build a block carrying a *timing* descriptor
 for the preferred mode rather than range limits. That is the untried variant and
 the one the evidence points at.
 
+### Not a pass-through either
+
+The obvious generalisation is to issue `GUD_REQ_GET_CONNECTOR_EDID`, pass on
+whatever comes back and send none when there is none, which is what the in-tree
+Linux driver does. Wrong default here, and not only because of the 15 kHz hazard.
+
+An EDID is not a name, it is a mode list. Windows reads modes out of its timing
+descriptors and those modes have no entry in the store, because nothing put them
+there — so `EvtIddCxAdapterCommitModes()` refuses them, which is the safety net
+working. The result is a display whose modes are listed and cannot be selected,
+and that happens on any device whose EDID describes timing its own mode list does
+not.
+
+So no EDID, for every device. If one turns out not to work without an EDID that
+is a runtime option and not a new default, and it can go in the `modelines.ini`
+the store already reads:
+
+```
+[options]
+edid = passthrough        ; default: none
+```
+
+Reconciling the EDID's modes against the store is the work. The switch is not.
+
 ## What is not here
 
 **Properties.** GUD carries a property mechanism — backlight, rotation, TV mode.
@@ -197,4 +270,10 @@ Not difficult; no GUD device in existence reports more than one.
 **Sub-byte formats.** `R1` and `XRGB1111` have no byte-per-pixel and every
 buffer-size calculation here assumes one. They exist for e-paper and tiny
 displays. `gud_format_bpp()` returns 0 for them and `gud_set_state()` refuses,
-rather than computing a wrong length quietly.
+rather than computing a wrong length quietly. Refusing is the right failure and
+the wrong end state — these are what e-paper and the tiny displays actually use,
+and reaching them means bits per pixel rather than bytes per pixel through
+`convert.c` and `gud_flush_rect()`.
+
+**EDID pass-through.** Covered above, and absent on purpose, not pending. The
+mode list an EDID brings with it is the problem, not the EDID.
