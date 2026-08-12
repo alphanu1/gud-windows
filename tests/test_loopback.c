@@ -135,21 +135,33 @@ static void t_probe(void)
     CHECK(host.connector.flags & GUD_CONNECTOR_FLAGS_INTERLACE,
           "INTERLACE not set -- a host will not offer 480i at all");
 
-    CHECK(host.n_modes == 4, "modes %u", host.n_modes);
+    CHECK(host.n_modes == 2, "modes %u", host.n_modes);
 }
 
 static void t_modes(void)
 {
-    /* The four the daemon advertises, with the numbers the roadmap states. */
+    /*
+     * Both modes the daemon advertises.
+     *
+     * The widths are chosen on the device side and are not round numbers on
+     * purpose: 648 and 632 at 16bpp are 1296 and 1264 bytes, whole numbers of
+     * 8-byte f2sdram beats, so neither needs stride padding. 642 was tried
+     * first and sheared. They are also widths no Switchres modeline will
+     * produce, so a log line names which mode is live without ambiguity.
+     *
+     * Same 12.600 MHz and same 800-total line for both, so the PLL counters do
+     * not change across a switch between them -- what changes is vtotal and
+     * interlace, 525i against 262p. Both are therefore 15.750 kHz, which is
+     * the 15 kHz line rate the CRT requires and the reason these numbers are
+     * a hardware constraint rather than a preference.
+     */
     struct { uint32_t clk, w, h; int inter; double hz, line_khz; } want[] = {
-        { 12600, 640, 480, 1, 60.00, 15.750 },
-        { 12500, 640, 576, 1, 50.00, 15.625 },
-        {  6300, 320, 240, 0, 60.11, 15.750 },
-        {  6250, 320, 288, 0, 50.08, 15.625 },
+        { 12600, 648, 480, 1, 60.000, 15.750 },
+        { 12600, 632, 240, 0, 60.115, 15.750 },
     };
     unsigned i;
 
-    for (i = 0; i < 4 && i < host.n_modes; i++) {
+    for (i = 0; i < sizeof want / sizeof want[0] && i < host.n_modes; i++) {
         const struct gud_display_mode_req *m = &host.modes[i];
         double hz = gud_mode_refresh_mhz(m) / 1000.0;
         double line = (double)m->clock / m->htotal;
@@ -167,7 +179,7 @@ static void t_modes(void)
     }
 
     CHECK(host.modes[0].flags & GUD_DISPLAY_MODE_FLAG_PREFERRED,
-          "640x480i60 is not flagged PREFERRED");
+          "648x480i60 is not flagged PREFERRED");
 }
 
 static void t_modeset(void)
@@ -395,7 +407,7 @@ static void t_modeline_roundtrip(void)
     }
 
     /* The fallback survives a little rounding... */
-    e = modeline_store_find(&store, 640, 480,
+    e = modeline_store_find(&store, 648, 480,
                             gud_mode_refresh_mhz(&host.modes[0]) + 12, 1);
     CHECK(e != NULL, "fallback lookup failed with 12 mHz of rounding error");
 
@@ -403,7 +415,7 @@ static void t_modeline_roundtrip(void)
      * CRT, and must not collide. This is why the fallback window is tight and
      * why it is a fallback: there is no tolerance that both survives arbitrary
      * rounding and keeps these two apart. */
-    e = modeline_store_find(&store, 640, 480, 59940, 1);
+    e = modeline_store_find(&store, 648, 480, 59940, 1);
     CHECK(e == NULL, "59.94 matched a 60.00 entry");
 
     /* The exact lookup: what EvtIddCxAdapterCommitModes really calls, keyed on
@@ -422,17 +434,17 @@ static void t_modeline_roundtrip(void)
                   "exact lookup returned a different mode for %u", i);
     }
 
-    /* The exact key separates what the fuzzy one cannot. 640x480i60 and a
-     * hypothetical 640x480i59.94 differ in pixel clock, and that is enough. */
+    /* The exact key separates what the fuzzy one cannot. 648x480i60 and a
+     * hypothetical 648x480i59.94 differ in pixel clock, and that is enough. */
     e = modeline_store_find_exact(&store, host.modes[0].clock - 13,
                                   host.modes[0].htotal, host.modes[0].vtotal,
-                                  640, 480, 1);
+                                  648, 480, 1);
     CHECK(e == NULL, "exact lookup matched a different pixel clock");
 
     /* Progressive and interlaced at the same geometry must not collide. */
-    e = modeline_store_find(&store, 640, 480,
+    e = modeline_store_find(&store, 648, 480,
                             gud_mode_refresh_mhz(&host.modes[0]), 0);
-    CHECK(e == NULL, "640x480p matched the 640x480i entry");
+    CHECK(e == NULL, "648x480p matched the 648x480i entry");
 
     /* parse -> format -> parse must be a fixed point */
     for (i = 0; i < host.n_modes; i++) {
@@ -488,10 +500,10 @@ static void t_ini(void)
         "[modelines]\n"
         "cps2 = ModeLine \"384x224@60\" 7.560 384 400 432 480 224 227 230 262 -hsync -vsync\n"
         "\n"
-        "ModeLine \"bare\" 6.300 320 332 362 400 240 243 246 262 -hsync -vsync\n"
+        "ModeLine \"bare\" 12.600 632 660 716 800 240 243 246 262 -hsync -vsync\n"
         "5.040 256 264 288 320 224 227 230 262\n"
-        "; override the device's own 640x480i60 with a different front porch\n"
-        "ntsc = ModeLine \"640x480@60\" 12.600 640 672 724 800 480 486 492 525 interlace -hsync -vsync\n");
+        "; override the device's own 648x480i60 with a different front porch\n"
+        "ntsc = ModeLine \"648x480@60\" 12.600 648 672 730 800 480 486 492 525 interlace -hsync -vsync\n");
     fclose(f);
 
     modeline_store_reset(&store);
@@ -501,10 +513,16 @@ static void t_ini(void)
     /*
      * Four entries, two of them new.
      *
-     * 384x224 and 256x224 are not advertised, so they are added. 320x240@60
-     * and 640x480i60 both collide with a device mode and replace it, which is
+     * 384x224 and 256x224 are not advertised, so they are added. 632x240p60
+     * and 648x480i60 both collide with a device mode and replace it, which is
      * the override working -- the ini is loaded second precisely so it can.
      * So the count grows by two, not four.
+     *
+     * The two colliding entries have to be kept in step with what the device
+     * actually advertises. They were written against 320x240p60 and 640x480i60
+     * and silently stopped colliding when the device moved to 632 and 648:
+     * nothing overrode anything, all four entries were added, and the only
+     * symptom was this count.
      */
     CHECK(store.n == host.n_modes + 2, "store has %u, expected %u",
           store.n, host.n_modes + 2);
@@ -514,12 +532,12 @@ static void t_ini(void)
     if (e) CHECK(!e->from_device && strcmp(e->name, "cps2") == 0,
                  "cps2 name/origin wrong: '%s'", e->name);
 
-    e = modeline_store_find(&store, 320, 240, 60115, 0);
+    e = modeline_store_find(&store, 632, 240, 60115, 0);
     CHECK(e != NULL, "bare ModeLine entry did not load");
     if (e) {
         CHECK(strcmp(e->name, "bare") == 0, "quoted name lost: '%s'", e->name);
         CHECK(e->from_device == 0,
-              "bare entry did not override the advertised 320x240p60");
+              "bare entry did not override the advertised 632x240p60");
     }
 
     e = modeline_store_find(&store, 256, 224, 60115, 0);
@@ -528,9 +546,9 @@ static void t_ini(void)
                  "sync polarity did not default to negative");
 
     /* the override: same geometry and rate as a device mode, different porch */
-    e = modeline_store_find(&store, 640, 480,
+    e = modeline_store_find(&store, 648, 480,
                             gud_mode_refresh_mhz(&host.modes[0]), 1);
-    CHECK(e != NULL, "640x480i60 vanished");
+    CHECK(e != NULL, "648x480i60 vanished");
     if (e) {
         CHECK(e->from_device == 0, "ini entry did not override the device one");
         CHECK(e->mode.hsync_start == 672,
