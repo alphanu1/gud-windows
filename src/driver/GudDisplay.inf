@@ -102,9 +102,25 @@ UmdfFileObjectPolicy     = AllowNullAndUnknownFileObjects
 UmdfDeviceObjectPolicy   = AllowNullAndUnknownFileObjects
 
 [GudDisplay_Install_Service]
-UmdfLibraryVersion = 2.33.0
+; 2.31, not 2.33. The WDK ships headers and stubs for both, so 2.33 builds and
+; installs cleanly and then fails to load: UMDF 2.33 is a Windows 11 framework
+; and this is Windows 10 19045, whose WUDFx02000.dll is on the 19041 branch and
+; provides at most 2.31. The symptom is a device with problem 31 and, only in
+; the DriverFrameworks-UserMode/Operational channel which ships disabled,
+; "The UMDF Host failed to load the driver at level 0" with 0xD000000D.
+;
+; Raise this only alongside the minimum OS the package is meant to install on.
+UmdfLibraryVersion = 2.31.0
 ServiceBinary      = %12%\UMDF\GudDisplay.dll
 UmdfExtensions     = IddCx0102
+; Whether UMDF accepts this line together with UmdfExtensions = IddCx is not
+; yet established. Nothing else pairs a WinUsb dispatcher with an IddCx
+; extension, so there is no prior art saying the combination works, and it is
+; one of three candidates for the DriverEntry failure that is still open --
+; the others being this driver's own WDF setup and IddCx declining a USB PDO.
+; Removing it temporarily is a one-line experiment worth running, but it was
+; not conclusive when tried: the reading came back contaminated by a pending
+; reboot. Separate the three with the minimal driver in BRINGUP step 4 first.
 UmdfDispatcher     = WinUsb
 
 [UMDriverCopy]

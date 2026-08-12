@@ -571,10 +571,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driverObject, PUNICODE_STRING registryPath)
 {
     WDF_DRIVER_CONFIG config;
     WDF_DRIVER_CONFIG_INIT(&config, EvtDriverDeviceAdd);
-    // Pool tag as a hex literal, not 'DUG'. A multi-character character
-    // constant has implementation-defined value, so the tag that shows up in a
-    // pool dump depends on the compiler rather than on what was written.
-    config.DriverPoolTag = 0x22445547;   // "GUD\"" little-endian
+
+    // No DriverPoolTag. The field is present in the UMDF headers so it
+    // compiles, but a pool tag is a kernel allocation concept and this driver
+    // runs in WUDFHost against the process heap. Setting it was the only
+    // non-default in this function and the only candidate for a WdfDriverCreate
+    // failure, which is what a level-0 load failure with everything already
+    // loaded amounts to.
 
     return WdfDriverCreate(driverObject, registryPath,
                            WDF_NO_OBJECT_ATTRIBUTES, &config, WDF_NO_HANDLE);
