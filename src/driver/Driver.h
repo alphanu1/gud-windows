@@ -26,8 +26,29 @@
 
 #pragma once
 
+// Before windows.h. Without it windows.h defines min and max as macros, and
+// the std::min/std::max in SwapChain.cpp expand to std::( -- "illegal token on
+// right side of ::". mingw's headers do not define them, so the cross-build
+// passes and only MSVC sees it.
+#ifndef NOMINMAX
+#  define NOMINMAX
+#endif
+
 #include <windows.h>
+
+// USB core types before wdfusb.h, which uses USBD_STATUS, PURB and the
+// USB_REQUEST_* constants without including anything that defines them:
+//   usbspec.h  descriptors and the standard request codes
+//   usb.h      USBD_STATUS and the URB structures
+#include <usbspec.h>
+#include <usb.h>
+
 #include <wdf.h>
+// wdfusb.h is a separate header in the real WDK -- wdf.h does not pull it in,
+// and without it every WdfUsbTargetDevice*/WDF_USB_* name is undeclared. The
+// stub in tests/wdkstub merged the two, so this only shows up against the real
+// thing.
+#include <wdfusb.h>
 #include <wudfwdm.h>
 #include <IddCx.h>
 
@@ -112,6 +133,13 @@ private:
     std::vector<uint8_t> m_conv;      // wire format, tightly packed
     std::vector<uint8_t> m_comp;      // LZ4 output
     std::unique_ptr<lz4enc_ctx> m_lz; // 256 KB, heap not stack
+
+    // Damage, fetched per frame into arrays this side owns. Kept as members
+    // and resized rather than allocated per frame: this runs at the field
+    // rate and a per-frame allocation is the jitter the staging texture is
+    // already sized once to avoid.
+    std::vector<RECT>             m_dirty;
+    std::vector<IDDCX_MOVEREGION> m_moves;
 
     std::thread       m_thread;
     std::atomic<bool> m_terminate{ false };

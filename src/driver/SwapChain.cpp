@@ -123,8 +123,14 @@ void SwapChainProcessor::RunCore()
     // returns the address of the lambda's own local and is dangling by the
     // time IddCx reads it. It compiled and would have worked most of the time,
     // which is the worst kind of wrong. Caught by -Wreturn-local-addr.
+    // IddCx wants the DXGI device, not the D3D11 one. Same object, different
+    // interface -- As() is the QueryInterface.
+    ComPtr<IDXGIDevice> dxgiDevice;
+    if (FAILED(m_d3dDevice.As(&dxgiDevice)))
+        return;
+
     IDARG_IN_SWAPCHAINSETDEVICE setDevice{};
-    setDevice.pDevice = m_d3dDevice.Get();
+    setDevice.pDevice = dxgiDevice.Get();
     if (FAILED(IddCxSwapChainSetDevice(m_swapChain, &setDevice)))
         return;
 
@@ -174,15 +180,53 @@ void SwapChainProcessor::RunCore()
             const auto& md = buffer.MetaData;
 
             if (md.DirtyRectCount == 0 && md.MoveRegionCount == 0) {
-                // No metadata means the whole surface, which is what the first
-                // frame after a modeset always is.
+                // No damage at all means the whole surface, which is what the
+                // first frame after a modeset always is.
                 RECT full{ 0, 0, (LONG)m_mode.hdisplay, (LONG)m_mode.vdisplay };
                 rects.push_back(full);
             } else {
-                for (UINT i = 0; i < md.DirtyRectCount; i++)
-                    rects.push_back(md.pDirtyRect[i]);
-                for (UINT i = 0; i < md.MoveRegionCount; i++)
-                    rects.push_back(md.pMoveRegions[i].DestRect);
+                // IDDCX_METADATA carries only counts. The rects themselves come
+                // from separate calls into arrays this side allocates, and the
+                // OS reports how many it actually wrote -- which need not be
+                // the count the metadata gave, so the out-count governs.
+                if (md.DirtyRectCount) {
+                    m_dirty.resize(md.DirtyRectCount);
+
+                    IDARG_IN_GETDIRTYRECTS din{};
+                    din.DirtyRectInCount = md.DirtyRectCount;
+                    din.pDirtyRects      = m_dirty.data();
+
+                    IDARG_OUT_GETDIRTYRECTS dout{};
+                    if (SUCCEEDED(IddCxSwapChainGetDirtyRects(m_swapChain,
+                                                              &din, &dout)))
+                        for (UINT i = 0; i < dout.DirtyRectOutCount; i++)
+                            rects.push_back(m_dirty[i]);
+                }
+
+                // Move regions are damage at the destination only: the source
+                // pixels are already correct on the device and only where they
+                // landed needs sending. Treating both ends as damage doubles
+                // the cost of every window drag.
+                if (md.MoveRegionCount) {
+                    m_moves.resize(md.MoveRegionCount);
+
+                    IDARG_IN_GETMOVEREGIONS min{};
+                    min.MoveRegionInCount = md.MoveRegionCount;
+                    min.pMoveRegions      = m_moves.data();
+
+                    IDARG_OUT_GETMOVEREGIONS mout{};
+                    if (SUCCEEDED(IddCxSwapChainGetMoveRegions(m_swapChain,
+                                                               &min, &mout)))
+                        for (UINT i = 0; i < mout.MoveRegionOutCount; i++)
+                            rects.push_back(m_moves[i].DestRect);
+                }
+
+                // Both calls can come back with nothing usable; a frame with
+                // no rects must not fall through to rects[0] below.
+                if (rects.empty()) {
+                    IddCxSwapChainFinishedProcessingFrame(m_swapChain);
+                    continue;
+                }
             }
 
             // Past a threshold, one full surface is cheaper than the rects.

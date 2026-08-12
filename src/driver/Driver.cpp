@@ -153,13 +153,20 @@ IDDCX_TARGET_MODE MakeTargetMode(const gud_display_mode_req& m)
     // nowhere to put porches, which is the entire problem: this is a lossy
     // projection of the modeline, and the modeline itself has to be found
     // again at commit time from the store.
-    mode.TargetVideoSignalInfo.totalSize.cx  = m.htotal;
-    mode.TargetVideoSignalInfo.totalSize.cy  = m.vtotal;
-    mode.TargetVideoSignalInfo.activeSize.cx = m.hdisplay;
-    mode.TargetVideoSignalInfo.activeSize.cy = m.vdisplay;
-    mode.TargetVideoSignalInfo.pixelRate     = (UINT64)m.clock * 1000;
-    mode.TargetVideoSignalInfo.hSyncFreq.Numerator   = m.clock * 1000;
-    mode.TargetVideoSignalInfo.hSyncFreq.Denominator = m.htotal;
+    // IDDCX_TARGET_MODE::TargetVideoSignalInfo is a DISPLAYCONFIG_TARGET_MODE,
+    // which is a one-field wrapper around the signal info -- so the fields sit
+    // one level deeper than they do on IDDCX_PATH, which carries a bare
+    // DISPLAYCONFIG_VIDEO_SIGNAL_INFO. Note the lowercase spelling of the
+    // inner member; the outer one is capitalised.
+    auto& si = mode.TargetVideoSignalInfo.targetVideoSignalInfo;
+
+    si.totalSize.cx  = m.htotal;
+    si.totalSize.cy  = m.vtotal;
+    si.activeSize.cx = m.hdisplay;
+    si.activeSize.cy = m.vdisplay;
+    si.pixelRate     = (UINT64)m.clock * 1000;
+    si.hSyncFreq.Numerator   = m.clock * 1000;
+    si.hSyncFreq.Denominator = m.htotal;
 
     // vSync as an exact rational of millihertz over 1000, rather than
     // pixelRate over htotal*vtotal. Two reasons. The interlace doubling is
@@ -167,8 +174,8 @@ IDDCX_TARGET_MODE MakeTargetMode(const gud_display_mode_req& m)
     // mode at 30 Hz -- which Windows accepts and then drives at half rate.
     // And an exact rational is what makes the commit-time lookup exact: these
     // numbers come straight back in IDARG_IN_COMMITMODES_PATH.
-    mode.TargetVideoSignalInfo.vSyncFreq.Numerator   = gud_mode_refresh_mhz(&m);
-    mode.TargetVideoSignalInfo.vSyncFreq.Denominator = 1000;
+    si.vSyncFreq.Numerator   = gud_mode_refresh_mhz(&m);
+    si.vSyncFreq.Denominator = 1000;
 
     // Interlace: report it, because the sink is a 15 kHz CRT and 480i is the
     // whole point. Note the asymmetry with GUD, which carries rects in the
@@ -176,7 +183,7 @@ IDDCX_TARGET_MODE MakeTargetMode(const gud_display_mode_req& m)
     // interleave on read. So the surface Windows hands over is the full
     // progressive one either way, and interlace changes nothing above this
     // line -- only what the raster does with it.
-    mode.TargetVideoSignalInfo.scanLineOrdering =
+    si.scanLineOrdering =
         (m.flags & GUD_DISPLAY_MODE_FLAG_INTERLACE)
         ? DISPLAYCONFIG_SCANLINE_ORDERING_INTERLACED
         : DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
@@ -184,15 +191,15 @@ IDDCX_TARGET_MODE MakeTargetMode(const gud_display_mode_req& m)
     return mode;
 }
 
-// The single access most likely to disagree with a real IddCx.h, isolated so
-// there is one line to correct rather than several scattered through the
-// commit path. If the field turns out to be spelled differently, or
-// IDARG_IN_COMMITMODES_PATH carries the signal info directly rather than
-// wrapped in an IDDCX_TARGET_MODE, fix it here and nothing else changes.
+// The access predicted to disagree with a real IddCx.h, and it did -- though
+// the other way round from the guess. A commit path carries IDDCX_PATH, which
+// holds a bare DISPLAYCONFIG_VIDEO_SIGNAL_INFO; it is IDDCX_TARGET_MODE that
+// wraps one in a DISPLAYCONFIG_TARGET_MODE. Isolated here regardless, so a
+// future version moving it again is one line.
 const DISPLAYCONFIG_VIDEO_SIGNAL_INFO&
-SignalInfo(const IDARG_IN_COMMITMODES_PATH& p)
+SignalInfo(const IDDCX_PATH& p)
 {
-    return p.TargetVideoSignalInfo.TargetVideoSignalInfo;
+    return p.TargetVideoSignalInfo;
 }
 
 IDDCX_MONITOR_MODE MakeMonitorMode(const gud_display_mode_req& m)
@@ -200,7 +207,8 @@ IDDCX_MONITOR_MODE MakeMonitorMode(const gud_display_mode_req& m)
     IDDCX_MONITOR_MODE mode{};
     mode.Size = sizeof(mode);
     mode.Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER;
-    mode.MonitorVideoSignalInfo = MakeTargetMode(m).TargetVideoSignalInfo;
+    mode.MonitorVideoSignalInfo =
+        MakeTargetMode(m).TargetVideoSignalInfo.targetVideoSignalInfo;
     return mode;
 }
 
@@ -334,9 +342,10 @@ static NTSTATUS EvtIddCxAdapterCommitModes(
     auto* ctx = DeviceGetContext(WdfObjectContextGetObject(adapter));
 
     for (UINT i = 0; i < in->PathCount; i++) {
-        const IDARG_IN_COMMITMODES_PATH& path = in->pPaths[i];
+        const IDDCX_PATH& path = in->pPaths[i];
 
-        if (!path.Active) {
+        // Activity is a flag on the path, not a bool member.
+        if (!(path.Flags & IDDCX_PATH_FLAGS_ACTIVE)) {
             ctx->Processor.reset();
             gud_set_controller_enable(&ctx->Gud, 0);
             continue;
