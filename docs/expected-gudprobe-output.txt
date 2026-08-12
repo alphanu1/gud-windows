@@ -14,9 +14,16 @@ The two worth checking before anything else:
   flags   STATUS_ON_SET must be present. Without it every failed modeset from
           here on silently looks like a success.
 
-A mode count of 4 with wrong numbers in it means the wire structures are being
+A mode count of 2 with wrong numbers in it means the wire structures are being
 padded -- but the static asserts in include/gud.h should have stopped that at
 compile time, so check they were not compiled out.
+
+A mode count of 1 is not a fault: the second mode is the opt-in switch-test
+timing and BLITSCRT_MODES=noswitchtest on the device suppresses it. Neither
+width is round on purpose -- 648 and 632 at 16bpp are 1296 and 1264 bytes,
+whole 8-byte f2sdram beats, so neither needs stride padding, and neither is a
+width Switchres will generate, so a device log line names the live mode
+without ambiguity.
 
 ----------------------------------------------------------------------
 
@@ -26,15 +33,11 @@ descriptor
   flags            0x00000001 STATUS_ON_SET
   compression      0x01 LZ4
   max_buffer_size  0
-  size             256..800 x 192..640
+  size             256..1280 x 192..640
 formats            RGB565 RGB332
 connector 0        VGA, flags 0x00000003 INTERLACE POLL
-modes              4
-  [0]  640x480 i  60.000 Hz    12.600 MHz  line  15.750 kHz  PREFERRED
-      h 640 664 724 800   v 480 486 492 525   flags 0x41a
-  [1]  640x576 i  50.000 Hz    12.500 MHz  line  15.625 kHz
-      h 640 664 724 800   v 576 582 588 625   flags 0x1a
-  [2]  320x240 p  60.115 Hz     6.300 MHz  line  15.750 kHz
-      h 320 332 362 400   v 240 243 246 262   flags 0xa
-  [3]  320x288 p  50.080 Hz     6.250 MHz  line  15.625 kHz
-      h 320 332 362 400   v 288 291 294 312   flags 0xa
+modes              2
+  [0]  648x480 i  60.000 Hz    12.600 MHz  line  15.750 kHz  PREFERRED
+      h 648 670 730 800   v 480 486 492 525   flags 0x41a
+  [1]  632x240 p  60.115 Hz    12.600 MHz  line  15.750 kHz
+      h 632 656 716 800   v 240 243 246 262   flags 0xa

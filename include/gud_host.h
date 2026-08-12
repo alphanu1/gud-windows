@@ -27,14 +27,23 @@ extern "C" {
  *
  * ctrl_in/ctrl_out issue a vendor control transfer to the interface:
  *
- *     bmRequestType = 0x40 | (in ? 0x80 : 0)   vendor, recipient interface
+ *     bmRequestType = 0x41 | (in ? 0x80 : 0)   vendor, recipient interface
  *     bRequest      = request
  *     wValue        = value       (connector index where one applies, else 0)
  *     wIndex        = bInterfaceNumber
  *
- * That is what drivers/gpu/drm/gud/gud_drv.c does in gud_usb_control_msg(),
- * and a device is entitled to depend on it. wIndex carrying the interface
- * number rather than zero is the part that is easy to get wrong.
+ * That is what drivers/gpu/drm/gud/gud_drv.c does in gud_usb_control_msg():
+ * USB_TYPE_VENDOR (0x40) | USB_RECIP_INTERFACE (0x01), plus USB_DIR_IN.
+ *
+ * The recipient nibble is not decoration. 0x40 is recipient *device*, and on
+ * Linux the gadget core routes by recipient before the function is reached: a
+ * device-recipient vendor request goes to the composite setup() and is stalled
+ * there, never arriving at the code that would have answered it. This was
+ * written as 0x40 and documented as "recipient interface", which is what it
+ * had to be, and the two disagreed until real hardware stalled every request
+ * with ERROR_GEN_FAILURE. The loopback harness cannot catch it: it routes
+ * gud_transport straight into the device's handler and no bmRequestType is
+ * ever constructed.
  *
  * Return the number of bytes transferred, or negative on failure. A short
  * read is not an error at this level; the callers check lengths themselves.

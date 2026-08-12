@@ -226,8 +226,15 @@ static int ctrl(void *ctx, int in, uint8_t request, uint16_t value,
      * and a device is entitled to rely on it. Sending wIndex = 0 works by
      * accident on any device with one interface and is the kind of thing that
      * breaks on the second device somebody tries.
+     *
+     * 0x41, not 0x40: USB_TYPE_VENDOR is 0x40 and USB_RECIP_INTERFACE is 0x01,
+     * and the recipient nibble decides routing on the far end. With 0x40 the
+     * Linux gadget core hands the request to the composite setup() rather than
+     * to the function that owns the interface, and it is stalled there without
+     * the daemon ever seeing it -- ERROR_GEN_FAILURE on this side, with the
+     * device otherwise enumerating perfectly. Found on first hardware contact.
      */
-    sp.RequestType = (UCHAR)(0x40 | (in ? 0x80 : 0x00));
+    sp.RequestType = (UCHAR)(0x41 | (in ? 0x80 : 0x00));
     sp.Request     = request;
     sp.Value       = value;
     sp.Index       = d->ifnum;
@@ -237,8 +244,35 @@ static int ctrl(void *ctx, int in, uint8_t request, uint16_t value,
      * transfer casts away const at the API boundary. Unavoidable, and the
      * only place in this file that does it. */
     if (!WinUsb_ControlTransfer(d->usb, sp, (PUCHAR)buf, (ULONG)len,
-                                &moved, NULL))
+                                &moved, NULL)) {
+        /*
+         * Say why. A bare "transfer failed" at bring-up leaves half a dozen
+         * candidates and no way to separate them from outside, and the win32
+         * code separates the two that actually happen:
+         *
+         *   31  ERROR_GEN_FAILURE  the device stalled ep0. It enumerated, so
+         *       the gadget is up, but nothing answered this vendor request --
+         *       the daemon is not running, or it does not implement it.
+         *   121 ERROR_SEM_TIMEOUT  no response at all within the timeout.
+         *
+         * Printed rather than returned, because every caller collapses this
+         * to GUD_E_IO and the detail is worth more than the tidiness.
+         */
+        DWORD e = GetLastError();
+        const char *hint = "";
+
+        if (e == 31)
+            hint = "  (device stalled ep0 -- is blitscrtd running?)";
+        else if (e == 121)
+            hint = "  (timed out -- device enumerated but is not answering)";
+        else if (e == 2 || e == 1167)
+            hint = "  (device gone -- cable or reset)";
+
+        fprintf(stderr, "  ctrl %s req 0x%02x val %u len %u: win32 %lu%s\n",
+                in ? "in " : "out", request, value, (unsigned)len,
+                (unsigned long)e, hint);
         return GUD_E_IO;
+    }
     return (int)moved;
 }
 

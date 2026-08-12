@@ -21,7 +21,14 @@
  *   gudprobe --testcard          modeset to the preferred mode and draw
  *   gudprobe --testcard --mode 2 the same, using mode index 2
  *   gudprobe --testcard --raw    same but with compression off
+ *   gudprobe --testcard --grey   greyscale card: a monotonic staircase rather
+ *                                than colour bars. Easier to confirm on a CRT
+ *                                -- a step out of order is a geometry fault
+ *                                and any tint means the channels are crossed
  *   gudprobe --bounce            move a rect around, to exercise damage
+ *   gudprobe --bounce --frames 500   the same, but stop rather than run
+ *                                until interrupted -- scriptable, and gives
+ *                                a per-rect average without a ctrl-c
  *   gudprobe --modeline "..."    set an unadvertised modeline, Switchres-style
  *   gudprobe --ini blitscrt.ini  load a modeline store and list what it holds
  */
@@ -45,7 +52,8 @@
  * A test card in BGRA, so it goes through exactly the conversion path the
  * driver's frame loop uses. Drawing straight into RGB565 would prove less.
  */
-static void draw_testcard(uint8_t *bgra, size_t pitch, uint32_t w, uint32_t h)
+static void draw_testcard(uint8_t *bgra, size_t pitch, uint32_t w, uint32_t h,
+                          int grey)
 {
     static const uint8_t bars[8][3] = {   /* R, G, B */
         {255,255,255}, {255,255,0}, {0,255,255}, {0,255,0},
@@ -58,13 +66,26 @@ static void draw_testcard(uint8_t *bgra, size_t pitch, uint32_t w, uint32_t h)
 
         for (x = 0; x < w; x++) {
             uint8_t r, g, b;
+            unsigned bar = (x * 8) / w;
 
-            if (y < h * 2 / 3) {                       /* colour bars */
-                const uint8_t *c = bars[(x * 8) / w];
-                r = c[0]; g = c[1]; b = c[2];
+            if (y < h * 2 / 3) {                       /* bars */
+                if (grey) {
+                    /* A monotonic staircase, black at the left. Easier to
+                     * read than colour on a CRT: a step out of order is a
+                     * geometry fault, and any tint at all means the BGRA to
+                     * RGB565 conversion has the channels crossed. */
+                    r = g = b = (uint8_t)(bar * 255 / 7);
+                } else {
+                    const uint8_t *c = bars[bar];
+                    r = c[0]; g = c[1]; b = c[2];
+                }
             } else if (y < h * 3 / 4) {                /* half amplitude */
-                const uint8_t *c = bars[(x * 8) / w];
-                r = c[0] / 2; g = c[1] / 2; b = c[2] / 2;
+                if (grey) {
+                    r = g = b = (uint8_t)(bar * 255 / 7 / 2);
+                } else {
+                    const uint8_t *c = bars[bar];
+                    r = c[0] / 2; g = c[1] / 2; b = c[2] / 2;
+                }
             } else {                                   /* 16-step ramp */
                 uint8_t v = (uint8_t)(((x * 16) / w) * 17);
                 r = g = b = v;
@@ -125,18 +146,36 @@ int main(int argc, char **argv)
     static struct gud_device d;
     static struct lz4enc_ctx lz;
     static struct modeline_store store;
-    int do_testcard = 0, do_bounce = 0, use_lz4 = 1, mode_index = -1;
+    int do_testcard = 0, do_bounce = 0, use_lz4 = 1, mode_index = -1, grey = 0;
+    int max_frames = 0;
     const char *ini = NULL, *modeline_str = NULL;
     const struct gud_display_mode_req *use = NULL;
     struct gud_display_mode_req custom;
     uint8_t format;
     int i, rc;
 
+    /*
+     * Line-buffered, so --bounce's progress appears as it happens even when
+     * stdout is a file or a pipe. Fully buffered is the default off a
+     * redirected handle, and a diagnostic that loops until interrupted then
+     * loses its whole buffer on the interrupt is no diagnostic at all.
+     *
+     * BUFSIZ rather than 0. glibc reads a size of 0 as "pick one for me", and
+     * MSVC's setvbuf validates the argument instead and rejects it -- the
+     * invalid-parameter handler calls __fastfail and the process dies with
+     * 0xC0000409 before main gets any further, which looks like a stack
+     * overrun and is not one.
+     */
+    setvbuf(stdout, NULL, _IOLBF, BUFSIZ);
+
     for (i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--testcard"))  do_testcard = 1;
         else if (!strcmp(argv[i], "--bounce"))    do_bounce = do_testcard = 1;
         else if (!strcmp(argv[i], "--raw"))       use_lz4 = 0;
+        else if (!strcmp(argv[i], "--grey") ||
+                 !strcmp(argv[i], "--gray"))      grey = 1;
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) mode_index = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--frames") && i + 1 < argc) max_frames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ini")  && i + 1 < argc) ini = argv[++i];
         else if (!strcmp(argv[i], "--modeline") && i + 1 < argc) modeline_str = argv[++i];
         else { fprintf(stderr, "unknown argument: %s\n", argv[i]); return 2; }
@@ -233,7 +272,7 @@ int main(int argc, char **argv)
         LARGE_INTEGER f, a, b;
 
         if (!bgra) { winusb_close(wd); return 1; }
-        draw_testcard(bgra, pitch, w, h);
+        draw_testcard(bgra, pitch, w, h, grey);
 
         QueryPerformanceFrequency(&f);
         QueryPerformanceCounter(&a);
@@ -276,7 +315,7 @@ int main(int argc, char **argv)
                 total += (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
 
                 /* repaint what we are about to leave */
-                draw_testcard(bgra, pitch, w, h);
+                draw_testcard(bgra, pitch, w, h, grey);
                 push_rect(&d, &lz, bgra, pitch, bx, by, bw, bh, use_lz4);
 
                 bx = (uint32_t)((int)bx + dx);
@@ -288,6 +327,11 @@ int main(int argc, char **argv)
 
                 if (++frames % 120 == 0)
                     printf("  %d rects, %.3f ms each\n", frames, total / frames);
+                if (max_frames && frames >= max_frames) {
+                    printf("  stopping after %d rects, %.3f ms each\n",
+                           frames, total / frames);
+                    break;
+                }
                 Sleep(8);
             }
         }
