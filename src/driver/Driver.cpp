@@ -10,8 +10,45 @@
 
 #include "Driver.h"
 
+#include <stdio.h>
+
 using namespace Microsoft::WRL;
 using namespace gudwin;
+
+// ===========================================================================
+// Bring-up logging
+// ===========================================================================
+//
+// The driver runs in WUDFHost in Session 0: printf goes nowhere, a message box
+// hangs the process, and a debugger means attaching to WUDFHost. UMDF's own
+// channel reports a failed load as one line with an NTSTATUS and no indication
+// of which call produced it, which is not enough to work with when every
+// experiment costs a driver reinstall and a reboot.
+//
+// So the driver says where it got to, in a file. WUDFHost runs as LocalSystem,
+// so ProgramData is writable. Opened and closed per line rather than held: this
+// has to survive the process being killed, and losing a buffered last line is
+// exactly the case being diagnosed.
+static void GudLog(const char* fmt, ...)
+{
+    CreateDirectoryA("C:\\ProgramData\\gud-windows", nullptr);
+
+    FILE* f = nullptr;
+    if (fopen_s(&f, "C:\\ProgramData\\gud-windows\\driver.log", "a") || !f)
+        return;
+
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    fprintf(f, "%02u:%02u:%02u.%03u  ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+
+    fputc('\n', f);
+    fclose(f);
+}
 
 // ===========================================================================
 // USB transport
@@ -24,15 +61,18 @@ NTSTATUS UsbTransport::Init(WDFDEVICE device)
     WDF_USB_DEVICE_SELECT_CONFIG_PARAMS sel;
 
     WDF_USB_DEVICE_CREATE_CONFIG_INIT(&cfg, USBD_CLIENT_CONTRACT_VERSION_602);
+    GudLog("UsbTransport::Init: entered");
     status = WdfUsbTargetDeviceCreateWithParameters(device, &cfg,
                                                     WDF_NO_OBJECT_ATTRIBUTES,
                                                     &UsbDevice);
+    GudLog("  WdfUsbTargetDeviceCreateWithParameters -> 0x%08X", (unsigned)status);
     if (!NT_SUCCESS(status))
         return status;
 
     WDF_USB_DEVICE_SELECT_CONFIG_PARAMS_INIT_SINGLE_INTERFACE(&sel);
     status = WdfUsbTargetDeviceSelectConfig(UsbDevice, WDF_NO_OBJECT_ATTRIBUTES,
                                             &sel);
+    GudLog("  WdfUsbTargetDeviceSelectConfig -> 0x%08X", (unsigned)status);
     if (!NT_SUCCESS(status))
         return status;
 
@@ -297,6 +337,30 @@ static NTSTATUS EvtIddCxAdapterInitFinished(
     return IddCxMonitorArrival(ctx->Monitor, &arrival);
 }
 
+// Parse a monitor description into modes.
+//
+// Required. IddCxDeviceInitConfig refuses a config without it -- it is the
+// second field of IDD_CX_CLIENT_CONFIG and the reason the driver failed with
+// STATUS_INVALID_PARAMETER, reported by UMDF as a level-0 load failure with no
+// mention of which call was at fault.
+//
+// This driver deliberately supplies no EDID, so there is no description to
+// parse and nothing to report: answer zero modes and succeed. IddCx then asks
+// EvtIddCxMonitorGetDefaultDescriptionModes instead, which is where the
+// modeline store actually answers. Failing here rather than returning zero
+// would take the monitor down with it.
+_Use_decl_annotations_
+static NTSTATUS EvtIddCxParseMonitorDescription(
+    const IDARG_IN_PARSEMONITORDESCRIPTION* in,
+    IDARG_OUT_PARSEMONITORDESCRIPTION* out)
+{
+    UNREFERENCED_PARAMETER(in);
+
+    out->MonitorModeBufferOutputCount = 0;
+    out->PreferredMonitorModeIdx      = 0;
+    return STATUS_SUCCESS;
+}
+
 // Windows asks what modes the monitor supports. Answer from the store, which
 // is the device list plus whatever has been written into the INI.
 _Use_decl_annotations_
@@ -524,9 +588,12 @@ static NTSTATUS EvtDriverDeviceAdd(WDFDRIVER, PWDFDEVICE_INIT deviceInit)
     // that turns an ordinary UMDF device into an indirect display, and the
     // thing to establish first on real hardware is that it is willing to do
     // that to a PDO it did not create -- see the note at the top of Driver.h.
+    GudLog("EvtDriverDeviceAdd: entered");
+
     IDD_CX_CLIENT_CONFIG config{};
     IDD_CX_CLIENT_CONFIG_INIT(&config);
 
+    config.EvtIddCxParseMonitorDescription      = EvtIddCxParseMonitorDescription;
     config.EvtIddCxAdapterInitFinished          = EvtIddCxAdapterInitFinished;
     config.EvtIddCxAdapterCommitModes           = EvtIddCxAdapterCommitModes;
     config.EvtIddCxMonitorGetDefaultDescriptionModes = EvtIddCxMonitorGetDefaultModes;
@@ -535,6 +602,7 @@ static NTSTATUS EvtDriverDeviceAdd(WDFDRIVER, PWDFDEVICE_INIT deviceInit)
     config.EvtIddCxMonitorUnassignSwapChain     = EvtIddCxMonitorUnassignSwapChain;
 
     NTSTATUS status = IddCxDeviceInitConfig(deviceInit, &config);
+    GudLog("EvtDriverDeviceAdd: IddCxDeviceInitConfig -> 0x%08X", (unsigned)status);
     if (!NT_SUCCESS(status))
         return status;
 
@@ -553,32 +621,45 @@ static NTSTATUS EvtDriverDeviceAdd(WDFDRIVER, PWDFDEVICE_INIT deviceInit)
 
     WDFDEVICE device = nullptr;
     status = WdfDeviceCreate(&deviceInit, &attrs, &device);
+    GudLog("EvtDriverDeviceAdd: WdfDeviceCreate -> 0x%08X", (unsigned)status);
     if (!NT_SUCCESS(status))
         return status;
 
     status = IddCxDeviceInitialize(device);
+    GudLog("EvtDriverDeviceAdd: IddCxDeviceInitialize -> 0x%08X", (unsigned)status);
     if (!NT_SUCCESS(status))
         return status;
 
     auto* ctx = new (DeviceGetContext(device)) DeviceContext();
     ctx->Device = device;
 
-    return ctx->Transport.Init(device);
+    NTSTATUS tstatus = ctx->Transport.Init(device);
+    GudLog("EvtDriverDeviceAdd: Transport.Init -> 0x%08X", (unsigned)tstatus);
+    return tstatus;
 }
 
 extern "C" _Use_decl_annotations_
 NTSTATUS DriverEntry(PDRIVER_OBJECT driverObject, PUNICODE_STRING registryPath)
 {
+    GudLog("DriverEntry: entered.  driverObject=%p registryPath=%p",
+           (void*)driverObject, (void*)registryPath);
+
     WDF_DRIVER_CONFIG config;
     WDF_DRIVER_CONFIG_INIT(&config, EvtDriverDeviceAdd);
 
     // No DriverPoolTag. The field is present in the UMDF headers so it
     // compiles, but a pool tag is a kernel allocation concept and this driver
-    // runs in WUDFHost against the process heap. Setting it was the only
-    // non-default in this function and the only candidate for a WdfDriverCreate
-    // failure, which is what a level-0 load failure with everything already
-    // loaded amounts to.
+    // runs in WUDFHost against the process heap.
 
-    return WdfDriverCreate(driverObject, registryPath,
-                           WDF_NO_OBJECT_ATTRIBUTES, &config, WDF_NO_HANDLE);
+    GudLog("DriverEntry: config.Size=%u DriverInitFlags=0x%x",
+           config.Size, config.DriverInitFlags);
+
+    NTSTATUS status = WdfDriverCreate(driverObject, registryPath,
+                                      WDF_NO_OBJECT_ATTRIBUTES,
+                                      &config, WDF_NO_HANDLE);
+
+    GudLog("DriverEntry: WdfDriverCreate -> 0x%08X %s",
+           (unsigned)status, NT_SUCCESS(status) ? "(ok)" : "(FAILED)");
+
+    return status;
 }
