@@ -19,6 +19,7 @@ cl /nologo /W4 /O2 /MT /I include ^
    src\common\modeline.c ^
    src\common\convert.c ^
    src\common\lz4enc.c ^
+   src\common\gud_dump.c ^
    /Fo:build\ /Fe:build\gudprobe.exe ^
    winusb.lib setupapi.lib
 
