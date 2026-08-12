@@ -30,7 +30,15 @@ Class       = Display
 ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
 Provider    = %Provider%
 CatalogFile = GudDisplay.cat
-DriverVer   = 08/12/2026,1.0.0.0
+; Must outrank GudProbeWinUsb.inf, which matches the same hardware ID. With an
+; identical DriverVer the incumbent binding wins and the device stays on
+; WinUSB, so this carries the higher version -- ranking compares the date
+; first, then the version, and equal dates fall through to the version.
+;
+; The date deliberately is not "today": inf2cat rejects a postdated DriverVer
+; against UTC, so a date set after local midnight in a positive offset fails
+; signability with 22.9.7 while looking perfectly reasonable.
+DriverVer   = 08/12/2026,1.1.0.0
 PnpLockdown = 1
 
 [Manufacturer]
@@ -54,21 +62,37 @@ PnpLockdown = 1
 [SourceDisksFiles]
 GudDisplay.dll = 1
 
+; 12,UMDF is drivers\umdf, which is where a UMDF2 binary goes and where
+; ServiceBinary below points. 13 is the driver store, which installs without
+; complaint and then cannot be loaded.
 [DestinationDirs]
-UMDriverCopy = 13
+UMDriverCopy = 12,UMDF
 
+; No `Include = WUDFRD.inf` / `Needs = WUDFRD.NT` here.
+;
+; That is the form Microsoft's own documentation shows, and WUDFRD.inf does not
+; exist on Windows 10 19045 -- only the WUDFRd.sys binary and its service do.
+; The include silently fails to resolve, every section that depends on it is
+; skipped, and the install ends as 0x0000000D ERROR_INVALID_DATA reported to
+; pnputil as the far less helpful 0x57 "the parameter is incorrect". The
+; setupapi.dev.log line is the only place it is named:
+;
+;     Could not include WUDFRD.inf under [GudDisplay_Install.NT].
+;
+; Registering the reflector service explicitly is what every working UMDF2 INF
+; in this machine's driver store does.
 [GudDisplay_Install.NT]
 CopyFiles = UMDriverCopy
-Include   = WUDFRD.inf
-Needs     = WUDFRD.NT
-
-[GudDisplay_Install.NT.hw]
-Include = WUDFRD.inf
-Needs   = WUDFRD.NT.HW
 
 [GudDisplay_Install.NT.Services]
-Include = WUDFRD.inf
-Needs   = WUDFRD.NT.Services
+AddService = WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[WUDFRD_ServiceInstall]
+DisplayName   = "Windows Driver Foundation - User-mode Driver Framework Reflector"
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\WUDFRd.sys
 
 [GudDisplay_Install.NT.Wdf]
 UmdfService              = GudDisplay, GudDisplay_Install_Service
@@ -79,7 +103,7 @@ UmdfDeviceObjectPolicy   = AllowNullAndUnknownFileObjects
 
 [GudDisplay_Install_Service]
 UmdfLibraryVersion = 2.33.0
-ServiceBinary      = %13%\GudDisplay.dll
+ServiceBinary      = %12%\UMDF\GudDisplay.dll
 UmdfExtensions     = IddCx0102
 UmdfDispatcher     = WinUsb
 
