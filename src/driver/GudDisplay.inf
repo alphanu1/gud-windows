@@ -104,6 +104,35 @@ ServiceBinary = %12%\WUDFRd.sys
 ; UmdfDispatcher below -- and adding them changed nothing except putting
 ; WinUsb in the device's LowerFilters, which was verified and did not help.
 
+; ---------------------------------------------------------------------------
+; IndirectKmd as an upper filter. This is not optional and nothing says so.
+;
+; IndirectKmd.sys is the kernel-mode half of the indirect display model -- the
+; component that connects an indirect display device to dxgkrnl. IddCx creates
+; the adapter in two stages: the driver calls IddCxAdapterInitAsync, and the OS
+; calls back into EvtIddCxAdapterInitFinished to complete it. That callback
+; comes through this filter. Without it in the stack IddCx accepts the adapter,
+; returns STATUS_SUCCESS, and then has no path to call back on: the device sits
+; at status=OK with problem=0, the driver runs perfectly, and no monitor ever
+; appears. There is no error anywhere, because nothing errored.
+;
+; Every IddCx driver Microsoft ships declares it. rdpidd.inf has these exact
+; two lines and it is where they came from. It is absent from the
+; IndirectDisplay sample's own INF, which is why it is easy to miss when
+; working from the sample.
+;
+; The security descriptor is copied from rdpidd.inf verbatim: D:P(A;;GA;;;WD)
+; is a protected DACL granting generic-all to Everyone. That is broader than it
+; looks and is worth revisiting once the thing works -- it is here because this
+; is the configuration known to work, not because it has been reasoned about.
+; ---------------------------------------------------------------------------
+[GudDisplay_Install.NT.HW]
+AddReg = GudDisplay_HardwareDeviceSettings
+
+[GudDisplay_HardwareDeviceSettings]
+HKR,,"UpperFilters",0x00010000,"IndirectKmd"
+HKR,,Security,,"D:P(A;;GA;;;WD)"
+
 [GudDisplay_Install.NT.Wdf]
 ; UmdfDispatcher belongs here, in the .Wdf section, not in the service install
 ; section below. It was in the service section, where nothing reads it, so the

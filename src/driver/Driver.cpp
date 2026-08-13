@@ -196,6 +196,19 @@ namespace {
 // operating both should not have to learn two spellings.
 const char* kIniPath = "C:\\ProgramData\\gud-windows\\modelines.ini";
 
+// The store, reachable from EvtIddCxParseMonitorDescription.
+//
+// That callback is handed a description and a mode buffer and nothing else --
+// no monitor, no adapter, no device -- so there is no object to hang a context
+// off and no way to reach the DeviceContext by the usual route. A file-scope
+// pointer is the way to it.
+//
+// This assumes one device, which is already assumed throughout: GET_CONNECTORS
+// takes connector 0, MaxMonitorsSupported is 1, and DESIGN.md's "what is not
+// here" says as much. A second GUD device on one machine needs this replaced
+// along with the rest of that assumption.
+modeline_store* g_ParseStore = nullptr;
+
 IDDCX_TARGET_MODE MakeTargetMode(const gud_display_mode_req& m)
 {
     IDDCX_TARGET_MODE mode{};
@@ -254,11 +267,17 @@ SignalInfo(const IDDCX_PATH& p)
     return p.TargetVideoSignalInfo;
 }
 
-IDDCX_MONITOR_MODE MakeMonitorMode(const gud_display_mode_req& m)
+// `origin` says where the mode came from, and IddCx cares which. Modes handed
+// back from EvtIddCxParseMonitorDescription are answering "what does this
+// descriptor say", so they are MONITORDESCRIPTOR; modes from
+// EvtIddCxMonitorGetDefaultDescriptionModes are the driver's own and are
+// DRIVER. Reporting DRIVER out of the parse callback is a contradiction.
+IDDCX_MONITOR_MODE MakeMonitorMode(const gud_display_mode_req& m,
+                                   IDDCX_MONITOR_MODE_ORIGIN origin)
 {
     IDDCX_MONITOR_MODE mode{};
     mode.Size = sizeof(mode);
-    mode.Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER;
+    mode.Origin = origin;
     mode.MonitorVideoSignalInfo =
         MakeTargetMode(m).TargetVideoSignalInfo.targetVideoSignalInfo;
     return mode;
@@ -277,6 +296,11 @@ NTSTATUS gudwin::ReloadModes(DeviceContext* ctx)
         return STATUS_DEVICE_DATA_ERROR;
     modeline_store_load_device(&ctx->Modes, &ctx->Gud);
     modeline_store_load_ini(&ctx->Modes, kIniPath);
+
+    // Publish it for EvtIddCxParseMonitorDescription, which has no handle to
+    // reach it by. Set after loading so the callback never sees a half-filled
+    // store, and set on every reload so it tracks the INI.
+    g_ParseStore = &ctx->Modes;
 
     if (ctx->Modes.n == 0)
         return STATUS_DEVICE_DATA_ERROR;
@@ -324,7 +348,20 @@ static NTSTATUS EvtIddCxAdapterInitFinished(
     // Create the monitor. Connector index 0; see gud_probe().
     IDDCX_MONITOR_INFO info{};
     info.Size = sizeof(info);
-    info.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HD15;   // VGA
+    // DIAGNOSTIC: HDMI, as the IndirectDisplay sample reports.
+    //
+    // This was HD15, on the reasoning that the only hop with a real connector
+    // is the analog one out of the device into the CRT. That reasoning is about
+    // what the user is told, and it may be that Windows will not accept it:
+    // HD15 describes a VGA socket on a graphics card, and this is an indirect
+    // display reached over USB. Everything else in IDDCX_MONITOR_INFO has now
+    // been eliminated as the cause of IddCxMonitorArrival failing, and this is
+    // the last field where the driver differs from the working sample.
+    //
+    // If this is what it was, the honest value is probably
+    // DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED rather than HDMI --
+    // revisit once it is known which way this goes.
+    info.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;   // VGA
     info.ConnectorIndex = 0;
 
     // No EDID.
@@ -340,10 +377,81 @@ static NTSTATUS EvtIddCxAdapterInitFinished(
     // If a name turns out to be needed, build a block with a *timing*
     // descriptor for the preferred mode rather than range limits, which is the
     // untried variant and the one the device's own notes point at.
+    // UNINITIALIZED, not EDID.
+    //
+    // This driver sends no EDID -- see DESIGN.md, and the reasons are on
+    // hardware -- so there is no description to declare. Saying EDID and then
+    // supplying DataSize 0 with a null pointer is a contradiction, and
+    // IddCxMonitorCreate rejects it with STATUS_INVALID_PARAMETER. The
+    // enumeration has a value for having nothing to say, which is this one.
+    //
+    // IddCx then asks EvtIddCxMonitorGetDefaultDescriptionModes for the mode
+    // list instead, which is where the modeline store answers, and
+    // EvtIddCxParseMonitorDescription is never given anything to parse.
+    // A minimal EDID, with deliberately no timing in it.
+    //
+    // IddCxMonitorCreate refuses a description of UNINITIALIZED with no data:
+    // it wants an EDID. The header comment saying "if the monitor does not have
+    // any description data this should be set to NULL" is stale -- the field is
+    // a struct by value, not a pointer, so there is no NULL to pass.
+    //
+    // This is the variant DESIGN.md names and had not been tried: a block with
+    // no detailed timing descriptors at all. Windows can derive no modes from
+    // it, so it asks EvtIddCxMonitorGetDefaultDescriptionModes instead, which
+    // is where the modeline store answers -- and the store is the only thing
+    // that knows the porches. An EDID carrying timings would put modes in front
+    // of Windows that the store has never heard of, and the commit path would
+    // rightly refuse them.
+    //
+    // Established and standard timings are zeroed for the same reason. The
+    // descriptors are a name and three dummies. Checksum is computed rather
+    // than hand-carried, because a wrong one is silent.
+    // DIAGNOSTIC: the IndirectDisplay sample's own EDID, byte for byte.
+    //
+    // The hand-built block this replaces was rejected somewhere -- most likely
+    // for having no detailed timing descriptor at all, which EDID 1.4 requires
+    // in the first descriptor slot. Rather than debug a hand-rolled EDID while
+    // also debugging the driver, borrow one that is known to work and find out
+    // whether the EDID is the remaining problem at all.
+    //
+    // This describes a Dell S2719DGF and is a lie about the hardware, so it
+    // cannot stay: the modes it advertises are nothing like a 15 kHz CRT's, and
+    // DESIGN.md's reasoning about not offering Windows timings the store has
+    // never heard of applies with full force. It is here to answer one question.
+    static BYTE edid[128] = {
+        0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00,0x10,0xAC,0xE6,0xD0,0x55,0x5A,0x4A,0x30,
+        0x24,0x1D,0x01,0x04,0xA5,0x3C,0x22,0x78,0xFB,0x6C,0xE5,0xA5,0x55,0x50,0xA0,0x23,
+        0x0B,0x50,0x54,0x00,0x02,0x00,0xD1,0xC0,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,
+        0x01,0x01,0x01,0x01,0x01,0x01,0x58,0xE3,0x00,0xA0,0xA0,0xA0,0x29,0x50,0x30,0x20,
+        0x35,0x00,0x55,0x50,0x21,0x00,0x00,0x1A,0x00,0x00,0x00,0xFF,0x00,0x37,0x4A,0x51,
+        0x58,0x42,0x59,0x32,0x0A,0x20,0x20,0x20,0x20,0x20,0x00,0x00,0x00,0xFC,0x00,0x53,
+        0x32,0x37,0x31,0x39,0x44,0x47,0x46,0x0A,0x20,0x20,0x20,0x20,0x00,0x00,0x00,0xFD,
+        0x00,0x28,0x9B,0xFA,0xFA,0x40,0x01,0x0A,0x20,0x20,0x20,0x20,0x20,0x20,0x00,0x2C
+    };
+
     info.MonitorDescription.Size = sizeof(info.MonitorDescription);
     info.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
-    info.MonitorDescription.DataSize = 0;
-    info.MonitorDescription.pData = nullptr;
+    info.MonitorDescription.DataSize = sizeof(edid);
+    info.MonitorDescription.pData = edid;
+
+    // MonitorContainerId must be set. Zero-initialising IDDCX_MONITOR_INFO
+    // leaves it GUID_NULL, and IddCxMonitorCreate rejects that with
+    // STATUS_INVALID_PARAMETER without saying which field it objected to.
+    //
+    // A container ID groups everything that is physically the same piece of
+    // equipment -- the header notes that a monitor with audio or touch in it
+    // should report the same ID for all of them. It has to be stable across
+    // reboots and driver upgrades, so this is a fixed constant rather than
+    // CoCreateGuid(): a fresh GUID every boot would present the same CRT to
+    // Windows as a different monitor each time.
+    //
+    // Fixed also means every GUD device on one machine shares it, which is
+    // wrong the day someone attaches two. Deriving it from the device -- the
+    // USB serial, or the connector index -- is the fix at that point.
+    static const GUID kContainerId =
+        { 0x9e8c1f3a, 0x5b47, 0x4c2e,
+          { 0xa1, 0x6d, 0x3f, 0x02, 0xd8, 0x74, 0xb9, 0x51 } };
+    info.MonitorContainerId = kContainerId;
 
     // The monitor gets its own context carrying the same back-pointer, so the
     // monitor callbacks can reach the device without guessing.
@@ -387,10 +495,85 @@ static NTSTATUS EvtIddCxParseMonitorDescription(
     const IDARG_IN_PARSEMONITORDESCRIPTION* in,
     IDARG_OUT_PARSEMONITORDESCRIPTION* out)
 {
-    UNREFERENCED_PARAMETER(in);
+    // Answer with the modeline store, not with nothing.
+    //
+    // Because a monitor description is supplied, this is the callback IddCx
+    // asks for the monitor's modes -- EvtIddCxMonitorGetDefaultDescriptionModes
+    // is for the case where there is no description to parse and is not reached
+    // here. Returning zero modes leaves the monitor with no modes at all, and
+    // IddCxMonitorArrival then fails with STATUS_INVALID_PARAMETER: a monitor
+    // that cannot display anything cannot arrive.
+    //
+    // The EDID handed to IddCxMonitorCreate deliberately carries no timing, so
+    // there is nothing in it to parse. The modes come from the store, which is
+    // the device's advertised list plus the INI -- the only thing that knows
+    // the porches. Parsing the description is the question IddCx is asking;
+    // the store is the honest answer to it.
+    //
+    // Two-pass, as the argument pair implies: an input count of zero asks how
+    // many there are, anything else is the buffer to fill.
+    GudLog("ParseMonitorDescription: CALLED. inCount=%u store=%p", in->MonitorModeBufferInputCount, (void*)g_ParseStore);
+    auto* store = g_ParseStore;
+    if (!store) {
+        out->MonitorModeBufferOutputCount = 0;
+        out->PreferredMonitorModeIdx      = 0;
+        return STATUS_SUCCESS;
+    }
 
-    out->MonitorModeBufferOutputCount = 0;
+    // ---- DIAGNOSTIC, TEMPORARY ----
+    // Report one plain 640x480p60 instead of the store, to answer a single
+    // question: does IddCxMonitorArrival fail because of *these* modes?
+    //
+    // Both store entries are things Windows may refuse as monitor modes --
+    // 648x480 is interlaced, and 632x240 is below the 640x480 minimum Windows
+    // has historically enforced. If a monitor has no acceptable mode it cannot
+    // arrive, which is exactly the symptom. A mode Windows cannot object to
+    // separates "our modes are rejected" from "something else is wrong", and
+    // that distinction decides whether this is a bug or a design problem.
+    //
+    // Remove once answered.
+    static const bool kDiagSafeMode = true;
+    static const gud_display_mode_req kSafe = {
+        25175,                      // clock kHz -- the standard 640x480p60
+        640, 656, 752, 800,         // h: display, sync start, sync end, total
+        480, 490, 492, 525,         // v
+        GUD_DISPLAY_MODE_FLAG_NHSYNC | GUD_DISPLAY_MODE_FLAG_NVSYNC
+    };
+
+    if (kDiagSafeMode) {
+        if (in->MonitorModeBufferInputCount == 0) {
+            out->MonitorModeBufferOutputCount = 1;
+            return STATUS_SUCCESS;
+        }
+        in->pMonitorModes[0] =
+            MakeMonitorMode(kSafe, IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR);
+        out->MonitorModeBufferOutputCount = 1;
+        out->PreferredMonitorModeIdx      = 0;
+        GudLog("  DIAG: reporting one 640x480p60 instead of the store");
+        return STATUS_SUCCESS;
+    }
+
+    if (in->MonitorModeBufferInputCount == 0) {
+        out->MonitorModeBufferOutputCount = store->n;
+        return STATUS_SUCCESS;
+    }
+
+    for (unsigned i = 0; i < store->n; i++) {
+        const auto& m = store->e[i].mode;
+        in->pMonitorModes[i] = MakeMonitorMode(m,
+                                               IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR);
+        GudLog("  mode[%u] %ux%u%s clk=%u total %ux%u vsync=%u/1000",
+               i, m.hdisplay, m.vdisplay,
+               (m.flags & GUD_DISPLAY_MODE_FLAG_INTERLACE) ? "i" : "p",
+               m.clock, m.htotal, m.vtotal, gud_mode_refresh_mhz(&m));
+    }
+
+    out->MonitorModeBufferOutputCount = store->n;
     out->PreferredMonitorModeIdx      = 0;
+    for (unsigned i = 0; i < store->n; i++)
+        if (store->e[i].mode.flags & GUD_DISPLAY_MODE_FLAG_PREFERRED)
+            out->PreferredMonitorModeIdx = i;
+
     return STATUS_SUCCESS;
 }
 
@@ -403,13 +586,15 @@ static NTSTATUS EvtIddCxMonitorGetDefaultModes(
     IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* out)
 {
     auto* ctx = MonitorGetContext(monitor)->Device;
+    GudLog("  monitor mode callback: entered");
 
     if (in->DefaultMonitorModeBufferInputCount == 0) {
         out->DefaultMonitorModeBufferOutputCount = ctx->Modes.n;
         return STATUS_SUCCESS;
     }
     for (unsigned i = 0; i < ctx->Modes.n; i++)
-        in->pDefaultMonitorModes[i] = MakeMonitorMode(ctx->Modes.e[i].mode);
+        in->pDefaultMonitorModes[i] = MakeMonitorMode(ctx->Modes.e[i].mode,
+                                                      IDDCX_MONITOR_MODE_ORIGIN_DRIVER);
 
     out->DefaultMonitorModeBufferOutputCount = ctx->Modes.n;
     out->PreferredMonitorModeIdx = 0;
@@ -427,6 +612,7 @@ static NTSTATUS EvtIddCxMonitorQueryModes(
     IDARG_OUT_QUERYTARGETMODES* out)
 {
     auto* ctx = MonitorGetContext(monitor)->Device;
+    GudLog("  monitor mode callback: entered");
 
     if (in->TargetModeBufferInputCount == 0) {
         out->TargetModeBufferOutputCount = ctx->Modes.n;
@@ -517,6 +703,7 @@ static NTSTATUS EvtIddCxMonitorAssignSwapChain(
     IDDCX_MONITOR monitor, const IDARG_IN_SETSWAPCHAIN* in)
 {
     auto* ctx = MonitorGetContext(monitor)->Device;
+    GudLog("  monitor mode callback: entered");
 
     ctx->Processor.reset();
     if (!ctx->Gud.active_valid)
@@ -590,8 +777,17 @@ static NTSTATUS EvtDeviceSelfManagedIoInit(WDFDEVICE device)
     IDDCX_ADAPTER_CAPS caps{};
     caps.Size = sizeof(caps);
     caps.MaxMonitorsSupported = 1;
-    caps.MaxDisplayPipelineRate =
-        (UINT64)ctx->Gud.desc.max_width * ctx->Gud.desc.max_height * 60;
+    // Left at zero, as the IndirectDisplay sample leaves it.
+    //
+    // This was set to max_width * max_height * 60 on the grounds that it was
+    // free to state truthfully. It is not free. The header says the OS "will
+    // ensure that the combined display pipeline rate of all the active modes
+    // will never exceed this value", and there is no way for the driver to
+    // declare what unit it meant -- so a number that means pixels per second
+    // here may be compared against something the OS reckons in bytes per
+    // second. At 32 bits per pixel a 640x480p60 mode is 73 Mbyte/s against a
+    // cap of 49 M, and then no mode fits and no monitor can arrive.
+    caps.MaxDisplayPipelineRate = 0;
 
     caps.EndPointDiagnostics.Size = sizeof(caps.EndPointDiagnostics);
     caps.EndPointDiagnostics.GammaSupport = IDDCX_FEATURE_IMPLEMENTATION_NONE;

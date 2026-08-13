@@ -175,10 +175,56 @@ Otherwise, this method may return STATUS_INVALID_PARAMETER." With the directive
 inert, changing its value between `WinUsb` and `NativeUSB` changed nothing,
 which is what made the dispatcher look innocent for several cycles.
 
-**Still to do here:** no monitor appears yet. `IddCxAdapterInitAsync` succeeding
-means IddCx will call `EvtIddCxAdapterInitFinished`, which runs
-`IddCxMonitorCreate` and `IddCxMonitorArrival`. That callback is instrumented;
-look there next.
+**Still to do here:** no monitor appears. `IddCxAdapterInitAsync` returns
+`STATUS_SUCCESS` and `EvtIddCxAdapterInitFinished` is **never called**, so
+`IddCxMonitorCreate` and `IddCxMonitorArrival` never run. The device is
+otherwise entirely healthy: `status=OK`, `problem=0`, no fault anywhere.
+
+The callback logs on its first line, before dereferencing the adapter context,
+so this is established rather than inferred — it is not a crash that happens to
+leave no trace. IddCx accepts the adapter and silently does not complete the
+second half of the two-stage creation.
+
+### What that is not
+
+Each of these was tried and made no difference. They are listed so nobody
+spends the night on them twice.
+
+| Suspected | Result |
+| --- | --- |
+| Crash before logging | No. The first statement is now the log line. |
+| Callback not registered | No. Six siblings in the same `IDD_CX_CLIENT_CONFIG` are called. |
+| `IDDCX_ADAPTER_CAPS` wrong | No. Matches the `IndirectDisplay` sample field for field. |
+| Called from the wrong callback | No. `D0Entry` and `EvtDeviceSelfManagedIoInit` behave identically. |
+| INF class / host process | No. `ClassVer = 2.0` and `UmdfHostProcessSharing = ProcessSharingDisabled` now match `rdpidd.inf`; no change. |
+| **Test signing / self-signed driver** | **No.** `bcdedit /set testsigning on`, rebooted, "Test Mode" watermark confirmed present. Identical behaviour. |
+
+That last one was the strongest hypothesis and it is wrong. It fitted every
+symptom — the driver is self-signed, IddCx creates a *graphics* adapter, and
+the graphics stack has stricter trust rules than PnP installation — and it is
+still wrong.
+
+Two things remain untried:
+
+1. **The minimal driver at the top of this step.** Root-enumerated, one
+   hardcoded mode, no USB, no GUD. It answers the only question left: does this
+   IddCx usage work at all outside a USB PDO? Everything else is eliminated, so
+   whichever way it goes the answer is informative. This step asked for it
+   first, it was skipped, and that has now cost three separate evenings' worth
+   of eliminations that it would have settled in one run.
+
+2. **`IddCxDebugCtrl`** under `HKLM\System\CurrentControlSet\Control\GraphicsDrivers`,
+   a DWORD bitfield. `0x0001` breaks into the debugger on IddCx error
+   detection, which would name the reason outright. It needs a kernel debugger
+   on a second machine, which is the thing this whole bring-up order exists to
+   avoid — but it is the definitive tool if the minimal driver does not settle
+   it.
+
+Note that IddCx's own WPP provider, `{D92BCB52-FA78-406F-A9A5-2037509FADEA}`,
+captures happily with `logman` -- 31 events during a device restart -- but
+cannot be decoded on Windows 10 19045: WPP information only reaches the public
+`IddCx.pdb` from build 19560, and this machine's IddCx is 10.0.19041.1, so
+`tracepdb` finds no trace entries.
 
 **Proved when:** a monitor appears in Display Settings, is selectable, and can
 be extended onto.
