@@ -5,7 +5,12 @@ is implemented.** It is written before the work rather than after it, so the
 shape of the problem is on paper while the device side is still being designed
 and can still change.
 
-Named `VBLANK.md` to match `DESIGN.md` and `BRINGUP.md`.
+> **Picking this up again?** Go to
+> [the questions at the end](#questions-to-answer-on-the-device-side-before-i-write-the-host-code)
+> first. They are the ones that decide the shape of the host code, they need
+> answering on the blitsCRT_Mister side, and the second of them — whether the
+> field counter and the timestamp latch together — will silently produce samples
+> out by a whole frame if it goes the wrong way.
 
 ## Why this matters here and not on an ordinary display
 
@@ -301,25 +306,55 @@ In the order they should be proved, matching how `BRINGUP.md` is organised.
 6. **Frame statistics reported.** **Proved when:** the OS's own presentation
    diagnostics agree with the driver's per-second line.
 
-## Open questions
+## Questions to answer on the device side before I write the host code
 
-Things I do not know and that should be settled on the device side before the
-host commits to a shape.
+Notes to myself. Each of these changes what the host has to do, so I want them
+settled on the blitsCRT_Mister side first — writing the estimator against a
+guess and then finding out I guessed wrong is a fortnight I do not need to
+spend.
 
-- **What clock should the device timestamp come from, and what is its
-  resolution?** A counter in the video clock domain is ideal — it is the clock
-  that actually matters — but it stops during a modeset. An HPS monotonic clock
-  is easier and is one domain removed from the raster.
-- **Does the field counter latch atomically with the timestamp?** If they are
-  read separately, a sample can straddle a field boundary and be wrong by a
-  whole period. It should be one register read, or a snapshot latched by
-  reading the first.
-- **What happens across a modeset?** The period changes, so the estimator must
-  be told rather than left to converge — it would take seconds and tear the
-  whole time. A field-counter reset or an explicit sequence number in the status
-  payload would let the host discard its history immediately.
-- **Is there a scanline register, or only vblank?** Beam chasing needs the
-  current line. Vblank alone is enough for milestones 1 to 5.
-- **How does this interact with `SET_STATE_COMMIT`?** The fabric latches timing
-  on the next vblank, so a modeset is already vblank-synchronised on the device
-  side; the host should know when that has taken effect rather than guessing.
+**Which clock do I take the timestamp from, and what resolution do I get?**
+A counter in the video clock domain is the honest one, because that is the clock
+the raster actually runs on and the whole point is to predict the raster. But it
+stops during a modeset, so every mode change throws away my time base. An HPS
+monotonic clock keeps running and is easier to read, at the cost of being one
+domain removed from the thing I am trying to predict — I would be measuring the
+video clock through it and inheriting whatever drift sits between them. Do I
+want correctness across a modeset or correctness during one? Probably the video
+domain, and handle the modeset explicitly, but check what resolution the counter
+actually gives me before deciding: anything coarser than about 10 us and the
+per-sample noise swamps the fit.
+
+**Do the field counter and the timestamp latch together?**
+This is the one that will waste my time silently if I get it wrong. If the host
+reads them as two separate registers, a read that straddles a field boundary
+gets a counter from one field and a timestamp from the next, and the sample is
+out by a whole period — 16.7 ms — while looking perfectly reasonable. It will
+show up as occasional huge outliers in the fit that I will be tempted to blame
+on USB. Make it one register read, or have reading the counter latch the
+timestamp into a shadow register. **Decide this before anything else**, because
+the estimator's outlier rejection is designed around what this answer is.
+
+**What happens across a modeset?**
+The field period changes, so everything the estimator has learned is wrong the
+instant `SET_STATE_COMMIT` takes effect. Left to reconverge on its own it would
+take seconds and tear for all of them. I want the host to *know*, not infer — a
+field counter that resets, or better a sequence number in the status payload
+that increments on every commit, so the host can throw its history away the
+first time it sees a new one. Cheap on the device, and it turns a multi-second
+glitch into a single frame.
+
+**Is there a scanline register, or only the vblank bit?**
+Only matters for beam chasing, which is milestone 5 onwards — writing a rect
+that sits entirely above the beam at any point in the frame rather than waiting
+for blanking. Vblank alone is enough to get milestones 1 to 4 done, so this is
+not urgent, but it is worth knowing whether the fabric could expose it before I
+design around not having it. If it is nearly free in the fabric, take it.
+
+**How does this interact with `SET_STATE_COMMIT`?**
+The fabric already latches timing on the next vblank, so a modeset is
+vblank-synchronised on the device side and I get that for nothing. What I do not
+have is any way to know *when* it happened — the host currently commits a mode
+and hopes. If the status payload carries the sequence number above, that answers
+this question and the modeset one with the same field, which is probably the
+right shape.
