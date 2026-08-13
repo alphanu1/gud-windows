@@ -66,6 +66,18 @@ NTSTATUS UsbTransport::Init(WDFDEVICE device)
                                                     WDF_NO_OBJECT_ATTRIBUTES,
                                                     &UsbDevice);
     GudLog("  WdfUsbTargetDeviceCreateWithParameters -> 0x%08X", (unsigned)status);
+
+    if (!NT_SUCCESS(status)) {
+        // Fall back to the plain form. WithParameters carries a USBD client
+        // contract version, which is a KMDF concept -- a UMDF driver reaches
+        // USB through winusb.sys and never speaks USBD, so the contract
+        // version may be what is being rejected rather than anything about
+        // the device. Trying both in one pass rather than guessing, because
+        // each guess otherwise costs a reinstall.
+        status = WdfUsbTargetDeviceCreate(device, WDF_NO_OBJECT_ATTRIBUTES,
+                                          &UsbDevice);
+        GudLog("  WdfUsbTargetDeviceCreate (plain)      -> 0x%08X", (unsigned)status);
+    }
     if (!NT_SUCCESS(status))
         return status;
 
@@ -505,6 +517,26 @@ static NTSTATUS EvtIddCxMonitorUnassignSwapChain(IDDCX_MONITOR monitor)
 // WDF plumbing
 // ===========================================================================
 
+// Create the USB target here, not in EvtDriverDeviceAdd.
+//
+// WdfUsbTargetDeviceCreateWithParameters needs the device started and the USB
+// stack present beneath it. Called from EvtDriverDeviceAdd -- where this driver
+// called it -- there is nothing underneath yet and it returns
+// STATUS_INVALID_PARAMETER, which reads like a bad argument and is really "too
+// early". EvtDevicePrepareHardware is the first callback where the hardware is
+// there, and it runs before EvtDeviceD0Entry, so gud_probe() still has a
+// working transport by the time it runs.
+_Use_decl_annotations_
+static NTSTATUS EvtDevicePrepareHardware(WDFDEVICE device, WDFCMRESLIST, WDFCMRESLIST)
+{
+    auto* ctx = DeviceGetContext(device);
+
+    GudLog("EvtDevicePrepareHardware: entered");
+    NTSTATUS status = ctx->Transport.Init(device);
+    GudLog("EvtDevicePrepareHardware: Transport.Init -> 0x%08X", (unsigned)status);
+    return status;
+}
+
 _Use_decl_annotations_
 static NTSTATUS EvtDeviceD0Entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE)
 {
@@ -608,7 +640,8 @@ static NTSTATUS EvtDriverDeviceAdd(WDFDRIVER, PWDFDEVICE_INIT deviceInit)
 
     WDF_PNPPOWER_EVENT_CALLBACKS power;
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&power);
-    power.EvtDeviceD0Entry = EvtDeviceD0Entry;
+    power.EvtDevicePrepareHardware = EvtDevicePrepareHardware;
+    power.EvtDeviceD0Entry         = EvtDeviceD0Entry;
     WdfDeviceInitSetPnpPowerEventCallbacks(deviceInit, &power);
 
     WDF_OBJECT_ATTRIBUTES attrs;
@@ -633,9 +666,9 @@ static NTSTATUS EvtDriverDeviceAdd(WDFDRIVER, PWDFDEVICE_INIT deviceInit)
     auto* ctx = new (DeviceGetContext(device)) DeviceContext();
     ctx->Device = device;
 
-    NTSTATUS tstatus = ctx->Transport.Init(device);
-    GudLog("EvtDriverDeviceAdd: Transport.Init -> 0x%08X", (unsigned)tstatus);
-    return tstatus;
+    // Transport.Init has moved to EvtDevicePrepareHardware -- see there.
+    GudLog("EvtDriverDeviceAdd: ok, USB deferred to PrepareHardware");
+    return STATUS_SUCCESS;
 }
 
 extern "C" _Use_decl_annotations_

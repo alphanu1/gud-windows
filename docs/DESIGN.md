@@ -65,8 +65,23 @@ would exist for no reason other than following the sample.
 
 The cost of the chosen shape is one assumption, stated plainly: IddCx has to be
 willing to attach to a PDO it did not create. Microsoft names this case
-directly — a USB dongle with a monitor attached — so it should work. It is still
-the one thing to prove before anything else is written. `BRINGUP.md` step 4.
+directly — a USB dongle with a monitor attached — so it should work.
+
+**It does.** On hardware, against a real USB PDO, `IddCxDeviceInitConfig` and
+`IddCxDeviceInitialize` both return `STATUS_SUCCESS`. Microsoft's indirect
+display overview also lists the USB dongle case as a scenario the model exists
+for, and states that an IDD is responsible for its own device communications.
+The assumption this whole file rests on is confirmed on both documentation and
+measurement, and the driver does not have to split in two.
+
+One thing is still open and it is narrower: whether that same device object can
+also host a USB target. `WdfUsbTargetDeviceCreate` fails on it with
+`STATUS_INVALID_PARAMETER` and the cause is not yet known — see `BRINGUP.md`
+step 4, which now carries the eliminations and the remaining hypothesis. If it
+turns out IddCx and USB cannot share one WDFDEVICE then this section is wrong
+after all, and the answer is a root-enumerated IddCx driver plus a separate
+transport. Nothing found so far says that, and the documentation says the
+opposite.
 
 ## Where the porches come from
 

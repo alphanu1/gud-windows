@@ -18,14 +18,27 @@ so Windows has nothing to match and leaves the device with no function driver.
 It appears in Device Manager with a warning triangle. That is expected and not
 a fault.
 
-Bind WinUSB. Either:
+**Done.** The INF route works and needs no test signing, which was not obvious
+and is worth writing down because it turns this from a manual Zadig step into a
+reproducible one:
 
 ```
-pnputil /add-driver src\driver\GudProbeWinUsb.inf /install
+inf2cat /driver:<staging dir> /os:10_X64
+signtool sign /fd sha256 /s My /sha1 <thumbprint> GudProbeWinUsb.cat
+pnputil /add-driver <staging dir>\GudProbeWinUsb.inf /install
 ```
 
-after test-signing it, or run Zadig and pick WinUSB against `1d50:614d`. Zadig
-is quicker for a first look; the INF is what makes the step reproducible.
+with a self-signed code-signing certificate imported into **both**
+`LocalMachine\Root` and `LocalMachine\TrustedPublisher`. No `bcdedit /set
+testsigning on`, no reboot, no watermark. The package loads no new kernel
+binary — winusb.sys is Microsoft's and already signed — so trusting the
+publisher is enough for PnP to accept it.
+
+`DriverVer` must be present and must not be postdated **in UTC**: inf2cat
+compares against UTC, so a date set after local midnight in a positive offset
+fails signability with `22.9.7` while looking perfectly reasonable in the file.
+
+Zadig does the same job interactively if you would rather.
 
 **Proved when:** the device shows under "Universal Serial Bus devices" with no
 warning, and `gudprobe` gets past `winusb_open`.
@@ -100,27 +113,96 @@ not, the fault is in the rect arithmetic and nowhere near the transport.
 conversion, compression, modeset. Anything that goes wrong afterwards is IddCx.
 That is worth a day and it is why this tool exists.
 
+**Done.** All of it, on a real device: enumeration byte-identical to
+`expected-gudprobe-output.txt`, the greyscale and colour test cards, an
+unadvertised 384x224p60 modeline accepted and scanned out, and `--bounce`
+holding 0.83 ms per rect across 600 with no drift.
+
+It also earned the day it was allocated. `gud_probe` failed on the first real
+device with every control request stalled — `ERROR_GEN_FAILURE`, the daemon
+running and never seeing a request — because `bmRequestType` was `0x40`,
+recipient *device*, where GUD requires `0x41`, recipient *interface*. The Linux
+gadget core routes by recipient before the function is reached. The loopback
+harness cannot catch that class of fault at all: it replaces the transport, so
+no setup packet is ever built. Had this been attempted first through IddCx, the
+symptom would have been a driver that loads and shows nothing.
+
+`--grey` is worth using over the colour card. A monotonic staircase makes a
+step out of order obviously a geometry fault, and any tint at all means the
+BGRA to RGB565 conversion has the channels crossed.
+
 ## 4. Settle the structural question
 
 Everything in `src/driver/` rests on one assumption: that IddCx will attach to
 a device node it did not create — a real USB PDO rather than the root-enumerated
 software device every sample uses.
 
-Microsoft documents this exact case, a USB dongle with a monitor attached, so it
-should work. "Should" is not "does", and if it does not then the driver has to
-be restructured into a root-enumerated IddCx driver plus a separate transport,
-with every frame crossing a process boundary in Session 0. That is a different
-project and it is better to know now.
+**Half answered, and the half that is answered is the good half.** Against a
+real USB PDO, on hardware:
 
-So: build a driver that does nothing but the plumbing. `EvtDriverDeviceAdd`,
-`IddCxDeviceInitConfig`, `IddCxDeviceInitialize`, `IddCxAdapterInitAsync`, one
-monitor with one hardcoded 640x480 mode, and a swapchain processor that acquires
-frames and throws them away. No USB in it at all.
+```
+EvtDriverDeviceAdd: IddCxDeviceInitConfig -> 0x00000000
+EvtDriverDeviceAdd: WdfDeviceCreate       -> 0x00000000
+EvtDriverDeviceAdd: IddCxDeviceInitialize -> 0x00000000
+```
+
+IddCx accepts it. Microsoft's indirect display overview also lists "connecting
+a dongle to a PC via USB that has a regular monitor connected to it" as a
+scenario the model exists for, and says an IDD is responsible for its own
+device communications. The one-package design in `DESIGN.md` stands.
+
+What is **not** settled is whether that same device object can also be a USB
+target. `WdfUsbTargetDeviceCreate` and `WdfUsbTargetDeviceCreateWithParameters`
+both return `STATUS_INVALID_PARAMETER` from `EvtDevicePrepareHardware`, and the
+following have each been eliminated by a deploy: the callback it is called from,
+both API variants, `UmdfDispatcher` as `WinUsb` and as `NativeUSB`, and
+winusb.sys installed as a lower filter (confirmed present in the device's
+`LowerFilters`, and it changed nothing).
+
+The live hypothesis is that `IddCxDeviceInitConfig` transforms the
+`PWDFDEVICE_INIT` into something whose `WDFDEVICE` cannot host a USB target.
+
+**Do this step as originally written, and do it first.** Build a driver that
+does nothing but the plumbing: `EvtDriverDeviceAdd`, `IddCxDeviceInitConfig`,
+`IddCxDeviceInitialize`, `IddCxAdapterInitAsync`, one monitor with one hardcoded
+mode, and a swapchain processor that acquires frames and throws them away. No
+USB in it at all.
 
 **Proved when:** a monitor appears in Display Settings, is selectable, and can
 be extended onto — with nothing on the CRT, because nothing is being sent.
 
-Only then wire the USB transport in behind it.
+Then add USB to that known-good baseline. Going straight at the full driver on
+a USB PDO is what tangled the variables above; the minimal driver separates them
+in one run.
+
+### Debugging a driver that will not load
+
+Three things cost hours and none of them are discoverable from the failure.
+
+**Turn the UMDF log on before anything else.** It ships disabled and it is the
+only place a load failure is described:
+
+```
+wevtutil sl Microsoft-Windows-DriverFrameworks-UserMode/Operational /e:true
+```
+
+Even then it says "failed to load the driver at level 0" with an NTSTATUS and
+no indication of which call produced it. `0xD000000D` is `STATUS_INVALID_PARAMETER`
+with the customer bit set, and "level 0" covers `EvtDriverDeviceAdd` as well as
+`DriverEntry` — three cycles went into `DriverEntry`, which was never at fault.
+
+**Make the driver say where it got to.** `GudLog()` in `Driver.cpp` appends a
+line to `C:\ProgramData\gud-windows\driver.log`, opening and closing per line so
+a killed process still leaves the last one. WUDFHost runs as LocalSystem so the
+path is writable. One deploy with it in place produced the answer that three
+without it had not.
+
+**A reinstall leaves the device on problem 14 until the stack is rebuilt.**
+`pnputil /add-driver /install` reports "System reboot is needed", the device
+reads `CM_PROB_NEED_RESTART`, and any driver log from that moment is describing
+the *old* binary. For a USB device an unplug/replug rebuilds the stack and is
+much cheaper than a reboot. A reading taken while problem 14 is set is not
+evidence.
 
 ## 5. First frame
 

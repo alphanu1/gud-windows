@@ -1,7 +1,10 @@
 # gud-windows — WIP
 
-**Nothing here has run on hardware.** A scaffold pushed as a backup, not a
-working driver. Read *Status* before trusting any of it.
+**The wire is proved on hardware. The driver is not.** `gudprobe` enumerates a
+real device, sets modes and puts pixels on a CRT, including timings the device
+never advertised. The IddCx driver builds, installs, loads and runs its own code
+in the UMDF host, and stops one call short of a picture. Read *Status* before
+trusting any of it.
 
 ---
 
@@ -105,37 +108,60 @@ fixed-frequency deflection circuit.
 
 ## Status
 
-Four tiers, worst first.
+Worst first.
 
-### Broken — known semantic bugs in the driver
+### Blocked — one call, in the driver
 
-No compiler will catch these. WDF handles are all `void*` typedefs, so passing
-the wrong handle to the wrong function typechecks under any header, real or
-stubbed.
+`WdfUsbTargetDeviceCreate` and `WdfUsbTargetDeviceCreateWithParameters` both
+return `STATUS_INVALID_PARAMETER` from `EvtDevicePrepareHardware`. Everything
+before it succeeds. The driver's own log, which is what established this:
 
-1. **The context lookup is wrong in every callback.** They all do
-   `DeviceGetContext(WdfObjectContextGetObject(adapter))`.
-   `WdfObjectContextGetObject` takes a *context pointer* and returns the object
-   that owns it — this feeds it an `IDDCX_ADAPTER` handle and expects a
-   `WDFDEVICE` back. There is no such path. The correct pattern gives the IddCx
-   adapter and monitor their own WDF contexts holding a back-pointer, set
-   through the `ObjectAttributes` field in `IDARG_IN_ADAPTER_INIT` and
-   `IDARG_IN_MONITORCREATE` — declared in the stub, never used. Every callback
-   would dereference garbage. Microsoft's `IndirectDisplay` sample shows the
-   real pattern; copy it rather than reasoning about it.
+```
+DriverEntry: WdfDriverCreate            -> 0x00000000
+EvtDriverDeviceAdd: IddCxDeviceInitConfig -> 0x00000000
+EvtDriverDeviceAdd: WdfDeviceCreate       -> 0x00000000
+EvtDriverDeviceAdd: IddCxDeviceInitialize -> 0x00000000
+EvtDevicePrepareHardware: entered
+  WdfUsbTargetDeviceCreateWithParameters  -> 0xC000000D
+  WdfUsbTargetDeviceCreate (plain)        -> 0xC000000D
+```
 
-2. **Nothing destroys the device context.** `new (DeviceGetContext(device))
-   DeviceContext()` is placement-new into WDF memory with no matching
-   destructor. On device removal `~SwapChainProcessor` never runs and the frame
-   thread is never joined — the exact wedged-thread-in-Session-0 failure
-   `docs/BRINGUP.md` warns about. Needs an `EvtCleanupCallback`.
+Ruled out, each by a deploy: the callback it is called from, both API variants,
+`UmdfDispatcher` as `WinUsb` and as `NativeUSB`, and winusb.sys present as a
+lower filter (verified in the device's `LowerFilters`, and it changed nothing).
 
-3. **Adapter init is in the wrong callback.** `IddCxAdapterInitAsync` runs from
-   `EvtDeviceD0Entry`, which fires on every power transition. Resume from sleep
-   would re-probe USB and initialise a second adapter.
+The remaining hypothesis is that `IddCxDeviceInitConfig` transforms the
+`PWDFDEVICE_INIT` into something whose `WDFDEVICE` does not support USB
+targets. Two experiments settle it and neither has been run:
 
-Treat `src/driver/Driver.cpp` and `SwapChain.cpp` as a design document with
-syntax, not as code.
+1. Comment out `IddCxDeviceInitConfig`/`IddCxDeviceInitialize`, keep the rest.
+   If USB then works, IddCx and USB cannot share one device object and the
+   one-package design in `docs/DESIGN.md` needs revisiting.
+2. Build `BRINGUP.md` step 4's minimal driver — root-enumerated, no USB, one
+   hardcoded mode. A known-good IddCx baseline to add USB to.
+
+Skipping step 4 to go straight at the full driver on a USB PDO is why these are
+tangled, and it was a mistake.
+
+### Fixed, and worth not repeating
+
+All four originally-listed semantic bugs are fixed: the context lookup in every
+callback now goes through `AdapterContext`/`MonitorContext` back-pointers
+attached via `ObjectAttributes`, the device context has an `EvtCleanupCallback`
+so the frame thread is joined, and adapter re-initialisation on resume is
+refused. Alongside those, found by building and running rather than by reading:
+
+- `EvtIddCxParseMonitorDescription` is **mandatory**. Without it
+  `IddCxDeviceInitConfig` fails `STATUS_INVALID_PARAMETER` and UMDF reports only
+  "failed to load the driver at level 0".
+- **UMDF 2.33 is a Windows 11 framework.** On Windows 10 19045 it compiles,
+  signs and installs and then cannot load. 2.31 is the ceiling there.
+- `Include = WUDFRD.inf` / `Needs = WUDFRD.NT` is what the documentation shows
+  and **WUDFRD.inf does not exist on Windows 10 19045**. Register the reflector
+  explicitly with `AddService = WUDFRd,0x000001fa,...`.
+- The UMDF log channel that names any of this,
+  `Microsoft-Windows-DriverFrameworks-UserMode/Operational`, ships **disabled**.
+  Turn it on first: `wevtutil sl <channel> /e:true`.
 
 ### Compiled against stubs — the driver
 
@@ -150,17 +176,29 @@ That pass found a returned dangling pointer in the swapchain setup, bare
 multi-character pool tag, and a misspelled field. None would have been found by
 reading it.
 
-The stubs are guesses. The three structures most likely to differ are named at
-the top of `tests/wdkstub/IddCx.h`, and the one field access that depends on
-them is isolated in `SignalInfo()` so there is a single line to correct. Same
-for the two version-specific lines in `GudDisplay.inf` — `UmdfExtensions` and
-`UmdfLibraryVersion` — which must be copied from the `IndirectDisplay` sample
-that ships with the WDK.
+The stubs were guesses, and the driver has since had its first pass against the
+real WDK. Five things differed, in ascending order of consequence: `wdfusb.h`
+is a separate header, it needs `usbspec.h` and `usb.h` ahead of it, `NOMINMAX`
+was never defined so windows.h's macros mangled `std::min`,
+`IDARG_IN_COMMITMODES_PATH` does not exist (paths are `IDDCX_PATH`, and
+`IDDCX_TARGET_MODE` wraps its signal info one level deeper than `IDDCX_PATH`
+does), and **`IDDCX_METADATA` carries no rect arrays at all** — dirty rects and
+move regions come from `IddCxSwapChainGetDirtyRects`/`GetMoveRegions` into
+caller-allocated arrays. The frame loop was rebuilt for that.
 
-### Compiled and linked — `gudprobe.exe`
+Two of those passed `make windows` without complaint, which is the limit of
+that check: mingw defines no `min`/`max` macros and the stubs invented the
+metadata shape. A syntax pass proves the code is self-consistent, not correct.
 
-Cross-compiles and links for x86-64 Windows against Microsoft's real
-`winusb.lib` and `setupapi.lib`. Never run with a device attached.
+`UmdfExtensions` and `UmdfLibraryVersion` no longer need copying from anywhere.
+`IddCx0102` is right; `UmdfLibraryVersion` must be **2.31.0** on Windows 10 —
+see *Blocked* above.
+
+### Runs on hardware — `gudprobe.exe`
+
+Builds with `build.cmd` (Windows SDK, no WDK) and cross-builds with mingw.
+Enumerates a real blitsCRT_Mister, sets modes, and puts pictures on a 15 kHz
+CRT.
 
 **`gudprobe` is not a driver.** It talks to the device directly over WinUSB.
 Nothing appears in Display Settings; Windows does not know a display exists. It
@@ -173,8 +211,22 @@ gudprobe --modeline "7.560 384 400 432 480 224 227 230 262 -hsync -vsync"
 ```
 
 That timing is in no advertised list. The device solves the PLL for 7.560 MHz
-and scans it out. Proving that from the command line is worth doing before any
-of the driver exists.
+and scans it out. **This works.** It was the point of the tool and it is the
+point of the project, and it ran before any of the driver did.
+
+Measured on a real device at 648x480i60, RGB565:
+
+| | |
+| --- | --- |
+| full surface, LZ4 | 1.59 ms |
+| full surface, raw | 22.38 ms |
+| full surface at 384x224 | 0.85 ms |
+| one 64x48 damage rect | 0.83 ms, stable over 600 |
+
+A 16.7 ms field makes the raw figure **134% of the budget**, so compression is
+not an optimisation here, it is a requirement for full-frame updates. The
+bandwidth arithmetic in `docs/DESIGN.md` argued it was worth having; the
+measurement says it is load-bearing.
 
 ### Tested — everything above the transport
 
@@ -214,6 +266,16 @@ separate 59.94 from 60.00, a `vSyncFreq` missing its interlace doubling (which
 would have reported 480i to Windows as 30 Hz), an out-of-band test modeline the
 device correctly refused, and an INI key/value split that rejected every line in
 the example file.
+
+It also has a blind spot worth naming, because it cost a night. The harness
+routes `gud_transport` straight into `blitscrt_handle_ctrl`, so **no
+`bmRequestType` is ever constructed**. The byte was wrong — `0x40`, recipient
+device, where GUD requires `0x41`, recipient interface — and 93 passing checks
+said nothing, because the transport is exactly what the loopback replaces. On
+Linux the gadget core routes control requests by recipient before the function
+sees them, so every request went to the composite `setup()` and was stalled
+there while the device enumerated perfectly. Only hardware could find it.
+Anything below `struct gud_transport` needs a device.
 
 ```
 make windows        # cross-compile gudprobe.exe, compile the driver
@@ -272,22 +334,34 @@ The driver needs the WDK and the two version lines in `GudDisplay.inf` fixed.
 
 `docs/BRINGUP.md` has the detail.
 
-1. Bind WinUSB — `GudProbeWinUsb.inf` or Zadig. The gadget declares a
-   vendor-class interface with no Microsoft OS descriptors, so Windows leaves it
-   with no function driver.
-2. `gudprobe` — enumerate, diff against the expected output.
-3. `gudprobe --testcard`, then `--modeline`, then `--bounce`. **At the end of
-   this the whole wire is proved**, including an arbitrary modeline reaching the
-   device, and anything afterwards is IddCx. Worth a day.
-4. Settle the structural question: will IddCx attach to a PDO it did not create,
-   rather than the root-enumerated software device every sample uses? Microsoft
-   names this exact case — a USB dongle with a monitor attached — but if it does
-   not hold, the driver splits in two with every frame crossing a process
-   boundary in Session 0, and that is a different project. Prove it with a
-   driver that enumerates a monitor and throws frames away. No USB in it.
-5. Fix the three bugs above against the real headers and sample.
-6. First frame.
-7. A Switchres backend writing into the modeline store.
+Steps 1 to 3 are **done**. The wire is proved: WinUSB bound from a signed INF,
+enumeration byte-identical to `docs/expected-gudprobe-output.txt`, test card,
+an unadvertised 384x224p60 modeline accepted and scanned out, and 600 damage
+rects with no drift.
+
+Step 4 is **half answered**. IddCx does attach to a USB PDO it did not create:
+`IddCxDeviceInitConfig` and `IddCxDeviceInitialize` both return success on one,
+and Microsoft's indirect-display overview lists a USB dongle with a monitor
+attached as a scenario the model exists for. So the one-package design stands.
+What is not settled is whether that same device object can also be a USB target
+— see *Blocked*.
+
+1. Settle the USB question, with the two experiments in *Blocked*. Do the
+   minimal root-enumerated driver first; it is what step 4 asked for and
+   skipping it is why the variables are tangled.
+2. First frame. `kFullFrameOnly` in `Driver.h` sends the whole surface every
+   frame and skips damage entirely — 1.6 ms of a 16.7 ms field on measured
+   hardware, so it is affordable, and it takes every rect-arithmetic fault off
+   the table while the IddCx side is still unproven. Turn it off afterwards.
+3. Fix the modeline store's dedup: `modeline_store_add()` keys on geometry and
+   refresh within 20 mHz, so two per-game modelines at one geometry less than
+   about 3 kHz of pixel clock apart silently replace each other.
+   `modeline_store_find_exact()` can already tell them apart; only the insert
+   cannot. This bites a Switchres backend directly.
+4. A Switchres backend writing into the modeline store.
+
+Worth doing on the device side at some point, unchanged: Microsoft OS 2.0
+descriptors on the gadget remove the WinUSB binding step entirely.
 
 Worth doing on the device side at some point: Microsoft OS 2.0 descriptors on
 the gadget remove step 1 entirely. Windows binds WinUSB from a WCID descriptor
