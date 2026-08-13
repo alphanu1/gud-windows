@@ -265,6 +265,12 @@ IDDCX_TARGET_MODE MakeTargetMode(const gud_display_mode_req& m)
     // interleave on read. So the surface Windows hands over is the full
     // progressive one either way, and interlace changes nothing above this
     // line -- only what the raster does with it.
+    //
+    // It also does not survive the round trip: a mode set here as INTERLACED
+    // comes back through EvtIddCxAdapterCommitModes as PROGRESSIVE. Set it
+    // anyway, since it describes the mode honestly and the OS is free to
+    // ignore it, but nothing downstream may key on getting it back -- see the
+    // don't-care in the commit-time lookup.
     si.scanLineOrdering =
         (m.flags & GUD_DISPLAY_MODE_FLAG_INTERLACE)
         ? DISPLAYCONFIG_SCANLINE_ORDERING_INTERLACED
@@ -429,28 +435,51 @@ static NTSTATUS EvtIddCxAdapterInitFinished(
     // Established and standard timings are zeroed for the same reason. The
     // descriptors are a name and three dummies. Checksum is computed rather
     // than hand-carried, because a wrong one is silent.
-    // DIAGNOSTIC: the IndirectDisplay sample's own EDID, byte for byte.
+    // A minimal EDID carrying no timing at all.
     //
-    // The hand-built block this replaces was rejected somewhere -- most likely
-    // for having no detailed timing descriptor at all, which EDID 1.4 requires
-    // in the first descriptor slot. Rather than debug a hand-rolled EDID while
-    // also debugging the driver, borrow one that is known to work and find out
-    // whether the EDID is the remaining problem at all.
+    // IddCxMonitorCreate needs a description -- a type of UNINITIALIZED with no
+    // data is refused, and the header comment saying to pass NULL is stale,
+    // since the field is a struct by value. So there has to be an EDID, and
+    // this is the variant DESIGN.md named and had not tried: no detailed timing
+    // descriptors, no established timings, no standard timings.
     //
-    // This describes a Dell S2719DGF and is a lie about the hardware, so it
-    // cannot stay: the modes it advertises are nothing like a 15 kHz CRT's, and
-    // DESIGN.md's reasoning about not offering Windows timings the store has
-    // never heard of applies with full force. It is here to answer one question.
+    // That matters. Windows can derive no modes from this block, so it asks
+    // EvtIddCxParseMonitorDescription instead, and the answer is the modeline
+    // store -- the only thing that knows the porches. An EDID with timings in
+    // it would put modes in front of Windows that the store has never heard of,
+    // and EvtIddCxAdapterCommitModes would rightly refuse them, which is a
+    // display that lists modes it cannot set.
+    //
+    // Checksum computed rather than hand-carried, because a wrong one is
+    // silent.
     static BYTE edid[128] = {
-        0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00,0x10,0xAC,0xE6,0xD0,0x55,0x5A,0x4A,0x30,
-        0x24,0x1D,0x01,0x04,0xA5,0x3C,0x22,0x78,0xFB,0x6C,0xE5,0xA5,0x55,0x50,0xA0,0x23,
-        0x0B,0x50,0x54,0x00,0x02,0x00,0xD1,0xC0,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,
-        0x01,0x01,0x01,0x01,0x01,0x01,0x58,0xE3,0x00,0xA0,0xA0,0xA0,0x29,0x50,0x30,0x20,
-        0x35,0x00,0x55,0x50,0x21,0x00,0x00,0x1A,0x00,0x00,0x00,0xFF,0x00,0x37,0x4A,0x51,
-        0x58,0x42,0x59,0x32,0x0A,0x20,0x20,0x20,0x20,0x20,0x00,0x00,0x00,0xFC,0x00,0x53,
-        0x32,0x37,0x31,0x39,0x44,0x47,0x46,0x0A,0x20,0x20,0x20,0x20,0x00,0x00,0x00,0xFD,
-        0x00,0x28,0x9B,0xFA,0xFA,0x40,0x01,0x0A,0x20,0x20,0x20,0x20,0x20,0x20,0x00,0x2C
+        0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00, // header
+        0x1E,0xA4,                               // "GUD" packed 5-bit
+        0x4D,0x61,                               // product 0x614D
+        0x00,0x00,0x00,0x00,                     // serial
+        0x01,0x24,                               // week 1, year 2026
+        0x01,0x04,                               // EDID 1.4
+        0x80,0x00,0x00,0x78,0x0A,                // digital, size unknown, gamma
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, // chromaticity
+        0x00,0x00,0x00,                          // established timings: none
+        0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,
+        0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01, // standard timings: none
+        // descriptor 1: monitor name
+        0x00,0x00,0x00,0xFC,0x00,
+        'G','U','D',' ','d','i','s','p','l','a','y',0x0A,0x20,
+        // descriptors 2-4: unused
+        0x00,0x00,0x00,0x10,0x00, 0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0x00,0x00,0x00,0x10,0x00, 0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0x00,0x00,0x00,0x10,0x00, 0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0x00,                                    // no extensions
+        0x00                                     // checksum, filled in below
     };
+    {
+        unsigned sum = 0;
+        for (int i = 0; i < 127; i++)
+            sum += edid[i];
+        edid[127] = (BYTE)((256 - (sum & 0xff)) & 0xff);
+    }
 
     info.MonitorDescription.Size = sizeof(info.MonitorDescription);
     info.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
@@ -571,39 +600,6 @@ static NTSTATUS EvtIddCxParseMonitorDescription(
         return STATUS_SUCCESS;
     }
 
-    // ---- DIAGNOSTIC, TEMPORARY ----
-    // Report one plain 640x480p60 instead of the store, to answer a single
-    // question: does IddCxMonitorArrival fail because of *these* modes?
-    //
-    // Both store entries are things Windows may refuse as monitor modes --
-    // 648x480 is interlaced, and 632x240 is below the 640x480 minimum Windows
-    // has historically enforced. If a monitor has no acceptable mode it cannot
-    // arrive, which is exactly the symptom. A mode Windows cannot object to
-    // separates "our modes are rejected" from "something else is wrong", and
-    // that distinction decides whether this is a bug or a design problem.
-    //
-    // Remove once answered.
-    static const bool kDiagSafeMode = true;
-    static const gud_display_mode_req kSafe = {
-        25175,                      // clock kHz -- the standard 640x480p60
-        640, 656, 752, 800,         // h: display, sync start, sync end, total
-        480, 490, 492, 525,         // v
-        GUD_DISPLAY_MODE_FLAG_NHSYNC | GUD_DISPLAY_MODE_FLAG_NVSYNC
-    };
-
-    if (kDiagSafeMode) {
-        if (in->MonitorModeBufferInputCount == 0) {
-            out->MonitorModeBufferOutputCount = 1;
-            return STATUS_SUCCESS;
-        }
-        in->pMonitorModes[0] =
-            MakeMonitorMode(kSafe, IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR);
-        out->MonitorModeBufferOutputCount = 1;
-        out->PreferredMonitorModeIdx      = 0;
-        GudLog("  DIAG: reporting one 640x480p60 instead of the store");
-        return STATUS_SUCCESS;
-    }
-
     if (in->MonitorModeBufferInputCount == 0) {
         out->MonitorModeBufferOutputCount = store->n;
         return STATUS_SUCCESS;
@@ -697,20 +693,35 @@ static NTSTATUS EvtIddCxAdapterCommitModes(
         const auto& sig = SignalInfo(path);
         uint32_t w = sig.activeSize.cx;
         uint32_t h = sig.activeSize.cy;
-        int interlaced = (sig.scanLineOrdering ==
-                          DISPLAYCONFIG_SCANLINE_ORDERING_INTERLACED) ? 1 : 0;
+        GudLog("  path active %ux%u pixelRate=%llu total %ux%u slo=%u",
+               (unsigned)w, (unsigned)h,
+               (unsigned long long)sig.pixelRate,
+               (unsigned)sig.totalSize.cx, (unsigned)sig.totalSize.cy,
+               (unsigned)sig.scanLineOrdering);
 
-        // Exact first.
+        // Exact first, with interlace as don't-care.
         //
         // pixelRate and totalSize came from MakeTargetMode(), so four of the
         // modeline's five identifying numbers come straight back and the match
         // is exact rather than approximate. Only the sync starts and ends are
         // missing, and recovering those is the whole reason the store exists.
+        //
+        // The fifth number, interlace, does not come back. MakeTargetMode sets
+        // scanLineOrdering to INTERLACED for a 480i mode and the commit path
+        // reports PROGRESSIVE for that same mode -- the desktop IddCx
+        // composites is progressive, so the field order is normalised away
+        // somewhere above this driver. Keying on it means never matching an
+        // interlaced modeline, which refuses the commit, which restarts the
+        // driver, which is the loop this replaced.
+        //
+        // Dropping it costs nothing: two modelines agreeing on clock, both
+        // totals and both actives, and differing only in interlace, are not
+        // distinguishable from anything Windows hands us here either.
         const modeline_entry* e = modeline_store_find_exact(
             &ctx->Modes,
             (uint32_t)(sig.pixelRate / 1000),
             sig.totalSize.cx, sig.totalSize.cy,
-            w, h, interlaced);
+            w, h, -1);
 
         if (!e) {
             // Fallback, for a path that lost the totals somewhere. Tight
@@ -722,7 +733,7 @@ static NTSTATUS EvtIddCxAdapterCommitModes(
             if (sig.vSyncFreq.Denominator)
                 refresh_mhz = (uint32_t)(((UINT64)sig.vSyncFreq.Numerator * 1000)
                                          / sig.vSyncFreq.Denominator);
-            e = modeline_store_find(&ctx->Modes, w, h, refresh_mhz, interlaced);
+            e = modeline_store_find(&ctx->Modes, w, h, refresh_mhz, -1);
         }
 
         if (!e) {
@@ -736,10 +747,30 @@ static NTSTATUS EvtIddCxAdapterCommitModes(
             // safety net working, but a driver whose normal path depends on
             // the far end refusing it is a driver waiting for a device with a
             // looser check.
+            GudLog("  no modeline for this path -- refusing. store has %u:",
+                   ctx->Modes.n);
+            for (unsigned k = 0; k < ctx->Modes.n; k++) {
+                const auto& me = ctx->Modes.e[k].mode;
+                GudLog("    [%u] %ux%u%s clk=%u total %ux%u", k,
+                       (unsigned)me.hdisplay, (unsigned)me.vdisplay,
+                       (me.flags & GUD_DISPLAY_MODE_FLAG_INTERLACE) ? "i" : "p",
+                       (unsigned)me.clock,
+                       (unsigned)me.htotal, (unsigned)me.vtotal);
+            }
             return STATUS_INVALID_PARAMETER;
         }
 
+        GudLog("  modeline %s: %ux%u%s clk=%u h %u/%u/%u/%u v %u/%u/%u/%u",
+               e->name, (unsigned)e->mode.hdisplay, (unsigned)e->mode.vdisplay,
+               (e->mode.flags & GUD_DISPLAY_MODE_FLAG_INTERLACE) ? "i" : "p",
+               (unsigned)e->mode.clock,
+               (unsigned)e->mode.hdisplay, (unsigned)e->mode.hsync_start,
+               (unsigned)e->mode.hsync_end, (unsigned)e->mode.htotal,
+               (unsigned)e->mode.vdisplay, (unsigned)e->mode.vsync_start,
+               (unsigned)e->mode.vsync_end, (unsigned)e->mode.vtotal);
+
         int err = gud_set_state(&ctx->Gud, &e->mode, ctx->Format);
+        GudLog("  gud_set_state -> %d", err);
         if (err)
             return STATUS_INVALID_PARAMETER;
 
@@ -754,11 +785,14 @@ static NTSTATUS EvtIddCxMonitorAssignSwapChain(
     IDDCX_MONITOR monitor, const IDARG_IN_SETSWAPCHAIN* in)
 {
     auto* ctx = MonitorGetContext(monitor)->Device;
-    GudLog("  monitor mode callback: entered");
 
     ctx->Processor.reset();
-    if (!ctx->Gud.active_valid)
+    if (!ctx->Gud.active_valid) {
+        GudLog("AssignSwapChain: no active mode -- refusing");
         return STATUS_INVALID_DEVICE_STATE;
+    }
+    GudLog("AssignSwapChain: streaming %ux%u",
+           (unsigned)ctx->Gud.active.hdisplay, (unsigned)ctx->Gud.active.vdisplay);
 
     ctx->Processor = std::make_unique<SwapChainProcessor>(
         in->hSwapChain, in->RenderAdapterLuid, in->hNextSurfaceAvailable,
