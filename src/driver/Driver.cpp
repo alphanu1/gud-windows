@@ -389,9 +389,27 @@ static void QueryHardwareId(WDFDEVICE device, char* out, size_t len)
 // that never looked.
 static void WriteActiveModes(const DeviceContext* ctx)
 {
+    // Delete before creating, rather than truncating in place.
+    //
+    // The UMDF host runs as LOCAL SERVICE and this file is its own output, but
+    // it only has write access to it while it remains the owner. Anything that
+    // replaces the file -- an installer, a tool run elevated, a restored backup
+    // -- leaves it owned by somebody else with LOCAL SERVICE holding the
+    // directory's read-only grant, and every write from then on fails with
+    // EACCES. Observed exactly that, and the failure mode is the bad one: the
+    // driver carries on, the file stays behind, and anything reading it gets
+    // timings for modes that no longer exist.
+    //
+    // The host owns the directory, so it can always delete a child and create
+    // a fresh file it owns. That makes this self-healing.
+    remove(kActivePath);
+
     FILE* f = nullptr;
-    if (fopen_s(&f, kActivePath, "w") || !f)
+    errno_t e = fopen_s(&f, kActivePath, "w");
+    if (e || !f) {
+        GudLog("WriteActiveModes: cannot open %s (errno %d)", kActivePath, (int)e);
         return;
+    }
 
     fprintf(f, "; gud-windows active mode list -- generated, do not edit.\n");
     fprintf(f, "; The interlace flag here is authoritative. Windows reports\n");
@@ -415,6 +433,7 @@ static void WriteActiveModes(const DeviceContext* ctx)
             fprintf(f, "%s\n", line);
     }
     fclose(f);
+    GudLog("WriteActiveModes: wrote %u modes to %s", ctx->Modes.n, kActivePath);
 }
 
 // Rebuild Modes from the cached device list plus whatever the INI says now.
