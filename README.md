@@ -162,12 +162,41 @@ set_desktop_mode: \\.\DISPLAY68 (384x224@59)
 
 That is the thing this project was written to do.
 
+**Damage rects are on**, and the frame loop reports what it is doing once a
+second. A 48x48 block moving six pixels a tick:
+
+```
+frames: 39 in 1000 ms, 39 rects (1.0/frame), 0 coalesced, 0 full,
+        100512 px (1.7% of full-frame)
+```
+
+2592 pixels a frame, which is a 48x48 block that has moved six pixels — the
+dirty rect is the swept area to the pixel. With the whole surface damaged every
+frame, which is the case damage is supposed to rescue, both modes still hold
+60 fps:
+
+| mode | pixels/frame | frames/s |
+| --- | --- | --- |
+| 632x240p60 | 151,680 | 59-61 |
+| 648x480i60 | 311,040 | 59-61 |
+
+Twice the pixels, same rate, so the worst case is headroom rather than the
+operating point. 648x480i60 pacing at 60 rather than 30 was not a given: its
+pixel clock over its totals is 30 Hz, and Windows could have composited at that
+and let the device interlace two fields per frame. It paces to the `vSyncFreq`
+the driver reports instead.
+
 **One surprise worth reading before touching any of it:** interlace does not
 survive IddCx. A mode set as interlaced comes back progressive, both at commit
 time and to every application — `EnumDisplaySettings` reports no `DM_INTERLACED`
 for a 480i mode. It has caught two different pieces of code already. The driver
 publishes `C:\ProgramData\gud-windows\modes.active` with the real timings for
 anything that needs to reason about line rate; `docs/DESIGN.md` has the detail.
+
+**Installing it is the weakest part.** See *Signing* under what is left: a
+self-signed driver asks the user to trust a certificate as a root, and Defender
+may refuse the package outright on a machine that has never seen that
+certificate before.
 
 ### Fixed, and worth not repeating
 
@@ -406,13 +435,30 @@ The transport appears twice on purpose. `gudprobe` opens the device with
 different types and different error reporting and issue byte-identical
 transfers, so everything above `struct gud_transport` is shared.
 
+## Installing
+
+A packaged release with an installer and a guide is on the
+[releases page](https://github.com/alphanu1/gud-windows/releases). Unzip it,
+run `install.cmd` as administrator, plug the display in.
+
+Read `INSTALL.md` in that package first, and in particular the part about the
+certificate. The driver is self-signed, so installing means telling Windows to
+trust a certificate as a root — that is a real decision about your machine and
+the guide sets out what it means. Defender may also refuse the package; the
+guide covers that too. Both are the subject of item 1 under *Next*.
+
 ## Build on Windows
 
 ```
 build.cmd                       gudprobe.exe. Windows SDK, no WDK needed
+make windows                    mingw cross-build + the driver against stubs
+make test DEVICE=...            the test suite
 ```
 
-The driver needs the WDK and the two version lines in `GudDisplay.inf` fixed.
+The driver itself needs the WDK. `UmdfExtensions = IddCx0102` and
+`UmdfLibraryVersion = 2.31.0` in `GudDisplay.inf` are settled and correct for
+Windows 10 — 2.33 is a Windows 11 framework and will install, fail to load, and
+not say why.
 
 ---
 
@@ -427,14 +473,19 @@ rects with no drift. The driver loads on a USB PDO, brings up a monitor, puts
 the desktop on the CRT, takes modelines from outside while running, and a
 Switchres backend drives it.
 
-What is left, in order:
+What is left, worst first:
 
-1. **Turn `kFullFrameOnly` off.** It is in `Driver.h` and sends the whole
-   surface every frame, skipping damage entirely — 1.6 ms of a 16.7 ms field on
-   measured hardware, so it is affordable, and it took every rect-arithmetic
-   fault off the table while the IddCx side was unproven. That justification has
-   expired: there is a stable picture to compare against now, and the damage
-   path measured 0.83 ms for 600 rects on this hardware and is not exercised.
+1. **Signing.** This is the one that decides whether anyone else can use it.
+   The driver is self-signed, so installing means asking a user to trust a
+   certificate as a root — a real decision, and a reasonable thing to decline.
+   Worse, Windows Defender flags a newly signed binary as
+   `Trojan:Win32/Bearfoos.A!ml` and `pnputil` then refuses the package outright.
+   That is reputation rather than anything in the code: the identical binary
+   signed with a certificate the machine had already seen installs silently.
+   Reported to Microsoft as a false positive, which is per-hash and so needs
+   redoing on every rebuild. The actual fix is attestation signing through
+   Partner Center, which needs an EV certificate — and it removes the
+   trust-a-root step as well.
 2. **Fix the modeline store's dedup.** `modeline_store_add()` keys on geometry
    and refresh within 20 mHz, so two per-game modelines at one geometry less
    than about 3 kHz of pixel clock apart silently replace each other.
@@ -442,19 +493,26 @@ What is left, in order:
    cannot. This bites the Switchres backend directly, and now that the backend
    exists it is reachable rather than theoretical.
 3. **Replace the deferred monitor arrival.** It is a `std::thread` with a
-   two-second sleep, left over from a hypothesis that proved wrong. `StartModeWatch`
-   demonstrates a working WDF timer in the same driver, so there is no longer an
-   excuse for it.
+   two-second sleep, left over from a hypothesis that proved wrong.
+   `StartModeWatch` demonstrates a working WDF timer in the same driver, so
+   there is no longer an excuse for it.
 4. **Revisit `MonitorType` and the security descriptor.** `MonitorType` is
    `HDMI`, which was a diagnostic value; `INDIRECT_WIRED` is probably the honest
    one. `D:P(A;;GA;;;WD)` is `rdpidd.inf`'s verbatim and grants generic-all to
    Everyone — it is there because it is the known-working configuration, not
    because it has been reasoned about.
+5. **The release packaging is not in this repository.** The installer, the
+   uninstaller, the install guide and the script that signs and zips them were
+   written outside the tree, so a release cannot currently be reproduced from a
+   clean checkout. They want a `packaging/` directory.
+6. **No CI.** The tests, the mingw stub build and `gudprobe` would all run on a
+   stock runner; the driver needs the WDK and pinned UMDF 2.31, which is the
+   part that needs a real runner to settle.
 
 Worth doing on the device side at some point: Microsoft OS 2.0 descriptors on
-the gadget remove step 1 entirely. Windows binds WinUSB from a WCID descriptor
-with nothing to install, which is the difference between a board that works when
-plugged in and one that needs a driver installed first.
+the gadget remove step 1 of the bring-up entirely. Windows binds WinUSB from a
+WCID descriptor with nothing to install, which is the difference between a board
+that works when plugged in and one that needs a driver installed first.
 
 ## Licensing
 

@@ -282,18 +282,36 @@ changed nothing.
 **Proved when:** the desktop is on the CRT. **Done** — at 648x480i60 and
 632x240p60, each committed from the store with its own porches.
 
-Expect the first version to be slow and to have the wrong idea about damage.
-Measure before changing anything:
+`kFullFrameOnly` in `Driver.h` sends the whole surface every frame and skips
+damage entirely. Start there — it removes every rect-arithmetic fault from the
+picture while the IddCx side is still unproven — then turn it off, which is
+where it is now.
 
-- Time the staging copy and `Map` separately from everything else. That is the
-  unknown in the budget — the compression and the wire cost are both already
-  measured, from the device side, and neither is the problem.
-- Count rects per frame. If a mouse move is producing thirty of them, the
-  per-rect control transfer overhead is the cost, not the pixels. `kMaxRects`
-  in `SwapChain.cpp` is the lever and 32 is a guess.
-- Watch the daemon's own once-a-second line on the serial console. `critical
+The frame loop reports once a second, and those numbers are the measurement:
+
+```
+frames: 39 in 1000 ms, 39 rects (1.0/frame), 0 coalesced, 0 full,
+        100512 px (1.7% of full-frame)
+```
+
+- **`full` must stay at zero.** It counts frames where the compositor reported
+  no damage and the whole surface was sent instead. A damage path that is
+  quietly doing full frames under another name looks identical to a working one
+  in every other respect.
+- **Check the pixel count against the geometry you are moving.** 100512 over 39
+  frames is 2592 a frame, and a 48x48 block that has moved six pixels is
+  54x48 = 2592. Rect arithmetic that is off by a row still produces a plausible
+  picture, and this is what catches it.
+- **rects/frame is 1.0 on DWM, always.** It coalesces damage before an indirect
+  display driver sees it, so `kMaxRects` and the union path never run. Do not
+  tune a constant nothing reaches.
+- **Watch the daemon's own once-a-second line on the serial console.** `critical
   path` well under `available` means the device is idle waiting for frames and
   the shortfall is on this end.
+
+Measured here, with the whole surface damaged every frame: 632x240p60 and
+648x480i60 both hold 59-61 fps, at 151,680 and 311,040 pixels a frame. Twice the
+pixels, same rate.
 
 ## 6. Modelines from outside
 

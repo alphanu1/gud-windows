@@ -280,6 +280,19 @@ of a mostly-unchanged screen compresses extremely well — measured at 253x on a
 static screen — so the union is often cheaper than thirty small headers.
 `kMaxRects = 32` is a starting number and not a measured one.
 
+It also cannot be measured on this compositor, which is worth knowing before
+anyone tries. **DWM hands an indirect display driver exactly one dirty rect per
+frame**, having coalesced the damage itself, so the union path has never once
+run: `0 coalesced` across every measurement taken. The code stays, because
+nothing promises that behaviour, but the constant is unreachable here.
+
+What the damage path does buy is straightforward. A small moving object sends
+1.7% of the pixels a full-frame update would, at the same frame rate. And with
+the whole surface damaged every frame — the case damage exists to rescue —
+632x240p60 and 648x480i60 both still hold 59-61 fps, at 151,680 and 311,040
+pixels per frame respectively. Twice the pixels, same rate, so the full-frame
+case is the headroom rather than the operating point.
+
 ## Compression
 
 LZ4 block format, carried here rather than linked. The same reasoning as the
