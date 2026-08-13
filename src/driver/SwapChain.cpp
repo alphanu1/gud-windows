@@ -152,6 +152,14 @@ void SwapChainProcessor::RunCore()
             return;
     }
 
+    // Once-a-second summary of what the damage path is actually doing. Per
+    // frame is not an option -- GudLog opens and closes the file per line --
+    // and without it the difference between a working damage path and a
+    // broken one stays invisible until it shows up as a picture fault.
+    ULONGLONG statsAt = GetTickCount64();
+    unsigned  frames = 0, rectTotal = 0, coalesced = 0, fullFrames = 0;
+    ULONGLONG pixels = 0;
+
     while (!m_terminate) {
         IDARG_OUT_RELEASEANDACQUIREBUFFER buffer{};
         HRESULT hr = IddCxSwapChainReleaseAndAcquireBuffer(m_swapChain, &buffer);
@@ -243,12 +251,18 @@ void SwapChainProcessor::RunCore()
             // Each rect costs a SET_BUFFER control transfer plus a status read
             // behind it, and a control transfer occupies a whole microframe
             // whatever it carries.
+            frames++;
+            rectTotal += (unsigned)rects.size();
+            if (md.DirtyRectCount == 0 && md.MoveRegionCount == 0)
+                fullFrames++;
+
             if (rects.size() > kMaxRects) {
                 RECT u = rects[0];
                 for (size_t i = 1; i < rects.size(); i++)
                     u = UnionRect(u, rects[i]);
                 rects.clear();
                 rects.push_back(u);
+                coalesced++;
             }
 
             // One staging copy covering everything, then read rects out of it.
@@ -281,6 +295,8 @@ void SwapChainProcessor::RunCore()
                         c.bottom = std::min(c.bottom, (LONG)m_mode.vdisplay);
                         if (RectEmpty(c))
                             continue;
+                        pixels += (ULONGLONG)(c.right - c.left) *
+                                  (ULONGLONG)(c.bottom - c.top);
                         if (!SendRect(m_staging.Get(), c)) {
                             m_terminate = true;
                             break;
@@ -291,6 +307,27 @@ void SwapChainProcessor::RunCore()
         }
 
         IddCxSwapChainFinishedProcessingFrame(m_swapChain);
+
+        ULONGLONG now = GetTickCount64();
+        if (now - statsAt >= 1000) {
+            // rects/frame is the number that matters. Much above kMaxRects and
+            // the coalescing is doing the work rather than the damage path;
+            // near 1.0 with fullFrames high means the compositor is reporting
+            // no damage at all and everything is a full surface.
+            // The last figure is the one that says whether this is worth
+            // having: pixels actually sent as a percentage of what full-frame
+            // mode would have sent for the same frames.
+            ULONGLONG full = (ULONGLONG)m_mode.hdisplay * m_mode.vdisplay * frames;
+            GudLog("frames: %u in %llu ms, %u rects (%.1f/frame), "
+                   "%u coalesced, %u full, %llu px (%.1f%% of full-frame)",
+                   frames, now - statsAt, rectTotal,
+                   frames ? (double)rectTotal / frames : 0.0,
+                   coalesced, fullFrames, pixels,
+                   full ? 100.0 * (double)pixels / (double)full : 0.0);
+            statsAt = now;
+            frames = rectTotal = coalesced = fullFrames = 0;
+            pixels = 0;
+        }
     }
 }
 

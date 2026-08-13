@@ -29,7 +29,7 @@ using namespace gudwin;
 // so ProgramData is writable. Opened and closed per line rather than held: this
 // has to survive the process being killed, and losing a buffered last line is
 // exactly the case being diagnosed.
-static void GudLog(const char* fmt, ...)
+void gudwin::GudLog(const char* fmt, ...)
 {
     CreateDirectoryA("C:\\ProgramData\\gud-windows", nullptr);
 

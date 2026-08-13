@@ -123,12 +123,18 @@ private:
 
     // Send the whole surface every frame and skip damage entirely.
     //
-    // For bring-up. A full compressed 648x480 surface measured 1.6 ms on this
-    // hardware against a 16.7 ms field, so this costs about a tenth of the
-    // budget and nothing else -- cheap enough to prove the driver with, and it
-    // takes every rect-arithmetic fault off the table while the IddCx side is
-    // still unproven. The damage path is written and sits behind this.
-    static constexpr bool kFullFrameOnly = true;
+    // Off. It was on through bring-up, when a full compressed 648x480 surface
+    // measured 1.6 ms against a 16.7 ms field -- a tenth of the budget, cheap
+    // enough to prove the driver with, and it kept every rect-arithmetic fault
+    // off the table while the IddCx side was unproven. That justification
+    // expired once the desktop was stable: there is now a known-good picture to
+    // compare against, which is exactly what makes a damage fault findable.
+    //
+    // Kept as a switch rather than deleted, because it is the first thing to
+    // try when a picture fault looks like torn or stale regions. If the fault
+    // goes away with this on, it is the damage path; if it does not, it is
+    // below here.
+    static constexpr bool kFullFrameOnly = false;
 
     IDDCX_SWAPCHAIN m_swapChain;
     LUID            m_renderAdapter;
@@ -227,6 +233,14 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(MonitorContext, MonitorGetContext);
 // Reload the modeline store from the device list plus the on-disk INI, and
 // tell IddCx the monitor's mode list changed. Called at start and whenever the
 // device raises GUD_CONNECTOR_STATUS_CHANGED.
+// Bring-up logging, to C:\ProgramData\gud-windows\driver.log. Shared because
+// the frame loop needs it too -- it is the only way to see what the damage path
+// is doing, and it runs in Session 0 where nothing else can be seen.
+//
+// Opens and closes per line, so it must not be called per frame. The frame loop
+// reports once a second.
+void GudLog(const char* fmt, ...);
+
 NTSTATUS ReloadModes(DeviceContext* ctx);
 
 // Starts the periodic check on modelines.ini. Safe to call more than once.
