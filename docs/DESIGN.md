@@ -74,14 +74,16 @@ for, and states that an IDD is responsible for its own device communications.
 The assumption this whole file rests on is confirmed on both documentation and
 measurement, and the driver does not have to split in two.
 
-One thing is still open and it is narrower: whether that same device object can
-also host a USB target. `WdfUsbTargetDeviceCreate` fails on it with
-`STATUS_INVALID_PARAMETER` and the cause is not yet known — see `BRINGUP.md`
-step 4, which now carries the eliminations and the remaining hypothesis. If it
-turns out IddCx and USB cannot share one WDFDEVICE then this section is wrong
-after all, and the answer is a root-enumerated IddCx driver plus a separate
-transport. Nothing found so far says that, and the documentation says the
-opposite.
+**And the same device object hosts a USB target.** `WdfUsbTargetDeviceCreate`,
+`WdfUsbTargetDeviceSelectConfig` and then `gud_probe()` over WDF-USB all
+succeed, and the driver registers an IddCx adapter afterwards. One UMDF2 driver
+is both an IddCx display driver and a USB client driver on one PDO, which is
+the whole of what this section claimed and the whole of what it needed.
+
+The one cost worth recording is that the INF has to be exactly right, and gets
+no help when it is not: `UmdfDispatcher` lives in `[..._Install.NT.Wdf]`, and in
+the service install section it is silently inert. `BRINGUP.md` step 4 has the
+detail.
 
 ## Where the porches come from
 

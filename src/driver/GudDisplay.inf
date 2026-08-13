@@ -101,6 +101,19 @@ ServiceBinary = %12%\WUDFRd.sys
 ; WinUsb in the device's LowerFilters, which was verified and did not help.
 
 [GudDisplay_Install.NT.Wdf]
+; UmdfDispatcher belongs here, in the .Wdf section, not in the service install
+; section below. It was in the service section, where nothing reads it, so the
+; driver had no dispatcher at all -- and the WdfUsbTargetDeviceCreateWith-
+; Parameters documentation says exactly what that produces: "If you call this
+; method from a UMDF driver, you must specify the UmdfDispatcher directive in
+; the driver's INF file. Otherwise, this method may return
+; STATUS_INVALID_PARAMETER."
+;
+; NativeUSB rather than WinUsb. WinUsb is the UMDF 1.x route, where winusb.sys
+; is a lower filter and the framework dispatches I/O to it; UMDF 2 reaches USB
+; through the reflector and Microsoft's own UMDF2 USB sample (usb/umdf2_fx2)
+; sets NativeUSB with no WinUsb service and no LowerFilters at all.
+UmdfDispatcher           = NativeUSB
 UmdfService              = GudDisplay, GudDisplay_Install_Service
 UmdfServiceOrder         = GudDisplay
 UmdfKernelModeClientPolicy = AllowKernelModeClients
@@ -118,24 +131,14 @@ UmdfDeviceObjectPolicy   = AllowNullAndUnknownFileObjects
 ; Raise this only alongside the minimum OS the package is meant to install on.
 UmdfLibraryVersion = 2.31.0
 ServiceBinary      = %12%\UMDF\GudDisplay.dll
+; UmdfExtensions does belong here, in the service install section, unlike
+; UmdfDispatcher which is a .Wdf directive and has moved up there.
+;
+; IddCx alongside USB is documented as supported: Microsoft's indirect display
+; overview lists "connecting a dongle to a PC via USB that has a regular monitor
+; connected to it" as a scenario the model exists for, and notes an IDD is
+; responsible for its own device communications.
 UmdfExtensions     = IddCx0102
-; NativeUSB, not WinUsb.
-;
-; WinUsb is the UMDF 1.x way of reaching a USB device: winusb.sys is installed
-; as a lower filter and the framework dispatches I/O to it. UMDF 2 talks to USB
-; through the reflector directly and Microsoft's own UMDF2 USB sample
-; (usb/umdf2_fx2) sets NativeUSB with no WinUsb service and no LowerFilters at
-; all. With WinUsb here, WdfUsbTargetDeviceCreate and
-; WdfUsbTargetDeviceCreateWithParameters both fail with
-; STATUS_INVALID_PARAMETER -- there is no UMDF2 USB target to create, whatever
-; is or is not in the stack beneath.
-;
-; The combination this driver needs, IddCx alongside USB, is documented as
-; supported: Microsoft's indirect display overview lists "connecting a dongle
-; to a PC via USB that has a regular monitor connected to it" as a scenario the
-; model exists for, and notes an IDD is responsible for its own device
-; communications. So the pairing is not the problem; the dispatcher was.
-UmdfDispatcher     = NativeUSB
 
 [UMDriverCopy]
 GudDisplay.dll

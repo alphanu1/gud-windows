@@ -345,6 +345,7 @@ static NTSTATUS EvtIddCxAdapterInitFinished(
     MonitorGetContext(created.MonitorObject)->Device = ctx;
     ctx->Monitor = created.MonitorObject;
 
+    GudLog("AdapterInitFinished: monitor created, calling arrival");
     IDARG_OUT_MONITORARRIVAL arrival{};
     return IddCxMonitorArrival(ctx->Monitor, &arrival);
 }
@@ -545,6 +546,7 @@ static NTSTATUS EvtDeviceD0Entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE)
     gud_transport t{};
     ctx->Transport.Fill(&t);
 
+    GudLog("D0Entry: probing device over WDF-USB");
     if (int err = gud_probe(&ctx->Gud, &t)) {
         // A bad magic here is the useful diagnostic: it means something
         // enumerated with the right VID:PID that is not a GUD device, which on
@@ -562,7 +564,12 @@ static NTSTATUS EvtDeviceD0Entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE)
             return STATUS_DEVICE_DATA_ERROR;
     }
 
+    GudLog("D0Entry: gud_probe ok. magic=0x%08X modes=%u formats=%u fmt=0x%02x",
+           ctx->Gud.desc.magic, ctx->Gud.n_modes, ctx->Gud.n_formats, ctx->Format);
+
     NTSTATUS status = ReloadModes(ctx);
+    GudLog("D0Entry: ReloadModes -> 0x%08X, store has %u modes",
+           (unsigned)status, ctx->Modes.n);
     if (!NT_SUCCESS(status))
         return status;
 
@@ -580,12 +587,41 @@ static NTSTATUS EvtDeviceD0Entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE)
     IDDCX_ADAPTER_CAPS caps{};
     caps.Size = sizeof(caps);
     caps.MaxMonitorsSupported = 1;
+
+    // Not required -- the IndirectDisplay sample leaves this zero and works --
+    // but it is free to state truthfully, and it tracks the hardware rather
+    // than a constant: the descriptor's maximum raster at 60 Hz.
+    caps.MaxDisplayPipelineRate =
+        (UINT64)ctx->Gud.desc.max_width * ctx->Gud.desc.max_height * 60;
+
     caps.EndPointDiagnostics.Size = sizeof(caps.EndPointDiagnostics);
     caps.EndPointDiagnostics.GammaSupport = IDDCX_FEATURE_IMPLEMENTATION_NONE;
+
+    // WIRED_USB, not OTHER. It is what this is, and the enumeration has a value
+    // for it -- OTHER is 0xFFFFFFFF and exists for links that do not fit.
     caps.EndPointDiagnostics.TransmissionType =
-        IDDCX_TRANSMISSION_TYPE_OTHER;
-    caps.EndPointDiagnostics.pEndPointFriendlyName = L"GUD display";
+        IDDCX_TRANSMISSION_TYPE_WIRED_USB;
+
+    caps.EndPointDiagnostics.pEndPointFriendlyName     = L"GUD display";
     caps.EndPointDiagnostics.pEndPointManufacturerName = L"Generic USB Display";
+    caps.EndPointDiagnostics.pEndPointModelName        = L"blitsCRT";
+
+    // pFirmwareVersion and pHardwareVersion are not optional. Left null,
+    // IddCxAdapterInitAsync refuses the caps with STATUS_INVALID_PARAMETER and
+    // says nothing about which field it objected to. The IndirectDisplay sample
+    // points both at one IDDCX_ENDPOINT_VERSION with only Size and MajorVer
+    // filled in, which is what this does -- GUD carries no firmware or hardware
+    // revision, so there is nothing truthful to put in the other fields.
+    //
+    // Must outlive the call. IddCxAdapterInitAsync is asynchronous by name and
+    // reads the caps before returning, but a local here would be a stack
+    // address handed to the framework either way.
+    static IDDCX_ENDPOINT_VERSION version{};
+    version.Size     = sizeof(version);
+    version.MajorVer = 1;
+    caps.EndPointDiagnostics.pFirmwareVersion = &version;
+    caps.EndPointDiagnostics.pHardwareVersion = &version;
+
     init.pCaps = &caps;
 
     // The adapter carries a back-pointer to us, so EvtIddCxAdapterInitFinished
@@ -595,7 +631,9 @@ static NTSTATUS EvtDeviceD0Entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE)
     init.ObjectAttributes = &adapterAttrs;
 
     IDARG_OUT_ADAPTER_INIT out{};
+    GudLog("D0Entry: IddCxAdapterInitAsync...");
     status = IddCxAdapterInitAsync(&init, &out);
+    GudLog("D0Entry: IddCxAdapterInitAsync -> 0x%08X", (unsigned)status);
     if (!NT_SUCCESS(status))
         return status;
 

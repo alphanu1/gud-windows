@@ -151,29 +151,42 @@ a dongle to a PC via USB that has a regular monitor connected to it" as a
 scenario the model exists for, and says an IDD is responsible for its own
 device communications. The one-package design in `DESIGN.md` stands.
 
-What is **not** settled is whether that same device object can also be a USB
-target. `WdfUsbTargetDeviceCreate` and `WdfUsbTargetDeviceCreateWithParameters`
-both return `STATUS_INVALID_PARAMETER` from `EvtDevicePrepareHardware`, and the
-following have each been eliminated by a deploy: the callback it is called from,
-both API variants, `UmdfDispatcher` as `WinUsb` and as `NativeUSB`, and
-winusb.sys installed as a lower filter (confirmed present in the device's
-`LowerFilters`, and it changed nothing).
+**And so does USB, on the same device object.** That was the open half and it is
+now closed:
 
-The live hypothesis is that `IddCxDeviceInitConfig` transforms the
-`PWDFDEVICE_INIT` into something whose `WDFDEVICE` cannot host a USB target.
+```
+EvtDevicePrepareHardware: entered
+  WdfUsbTargetDeviceCreateWithParameters  -> 0x00000000
+  WdfUsbTargetDeviceSelectConfig          -> 0x00000000
+D0Entry: gud_probe ok. magic=0x1D50614D modes=2 formats=2 fmt=0x40
+D0Entry: ReloadModes -> 0x00000000, store has 2 modes
+D0Entry: IddCxAdapterInitAsync          -> 0x00000000
+```
 
-**Do this step as originally written, and do it first.** Build a driver that
-does nothing but the plumbing: `EvtDriverDeviceAdd`, `IddCxDeviceInitConfig`,
-`IddCxDeviceInitialize`, `IddCxAdapterInitAsync`, one monitor with one hardcoded
-mode, and a swapchain processor that acquires frames and throws them away. No
-USB in it at all.
+One UMDF2 driver is both an IddCx display driver and a USB client driver, it
+probes the device for itself, and it registers an adapter. `DESIGN.md`'s "one
+package, not two" is confirmed end to end.
+
+The blocker was never architectural. `UmdfDispatcher` was in the service install
+section rather than `[..._Install.NT.Wdf]`, where nothing reads it, and
+`WdfUsbTargetDeviceCreateWithParameters`'s own documentation names that exactly:
+"you must specify the UmdfDispatcher directive in the driver's INF file.
+Otherwise, this method may return STATUS_INVALID_PARAMETER." With the directive
+inert, changing its value between `WinUsb` and `NativeUSB` changed nothing,
+which is what made the dispatcher look innocent for several cycles.
+
+**Still to do here:** no monitor appears yet. `IddCxAdapterInitAsync` succeeding
+means IddCx will call `EvtIddCxAdapterInitFinished`, which runs
+`IddCxMonitorCreate` and `IddCxMonitorArrival`. That callback is instrumented;
+look there next.
 
 **Proved when:** a monitor appears in Display Settings, is selectable, and can
-be extended onto — with nothing on the CRT, because nothing is being sent.
+be extended onto.
 
-Then add USB to that known-good baseline. Going straight at the full driver on
-a USB PDO is what tangled the variables above; the minimal driver separates them
-in one run.
+The minimal root-enumerated driver this step originally called for is no longer
+needed to settle the architecture, but it remains the right tool if the monitor
+path misbehaves: it separates IddCx faults from USB and GUD ones in a single
+run.
 
 ### Debugging a driver that will not load
 

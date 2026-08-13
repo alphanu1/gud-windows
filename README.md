@@ -110,11 +110,10 @@ fixed-frequency deflection circuit.
 
 Worst first.
 
-### Blocked — one call, in the driver
+### In progress — the driver initialises, no monitor yet
 
-`WdfUsbTargetDeviceCreate` and `WdfUsbTargetDeviceCreateWithParameters` both
-return `STATUS_INVALID_PARAMETER` from `EvtDevicePrepareHardware`. Everything
-before it succeeds. The driver's own log, which is what established this:
+Every call from load to adapter registration now succeeds on hardware. The
+driver's own log:
 
 ```
 DriverEntry: WdfDriverCreate            -> 0x00000000
@@ -122,46 +121,68 @@ EvtDriverDeviceAdd: IddCxDeviceInitConfig -> 0x00000000
 EvtDriverDeviceAdd: WdfDeviceCreate       -> 0x00000000
 EvtDriverDeviceAdd: IddCxDeviceInitialize -> 0x00000000
 EvtDevicePrepareHardware: entered
-  WdfUsbTargetDeviceCreateWithParameters  -> 0xC000000D
-  WdfUsbTargetDeviceCreate (plain)        -> 0xC000000D
+  WdfUsbTargetDeviceCreateWithParameters  -> 0x00000000
+  WdfUsbTargetDeviceSelectConfig          -> 0x00000000
+D0Entry: gud_probe ok. magic=0x1D50614D modes=2 formats=2 fmt=0x40
+D0Entry: ReloadModes -> 0x00000000, store has 2 modes
+D0Entry: IddCxAdapterInitAsync          -> 0x00000000
 ```
 
-Ruled out, each by a deploy: the callback it is called from, both API variants,
-`UmdfDispatcher` as `WinUsb` and as `NativeUSB`, and winusb.sys present as a
-lower filter (verified in the device's `LowerFilters`, and it changed nothing).
-
-The remaining hypothesis is that `IddCxDeviceInitConfig` transforms the
-`PWDFDEVICE_INIT` into something whose `WDFDEVICE` does not support USB
-targets. Two experiments settle it and neither has been run:
-
-1. Comment out `IddCxDeviceInitConfig`/`IddCxDeviceInitialize`, keep the rest.
-   If USB then works, IddCx and USB cannot share one device object and the
-   one-package design in `docs/DESIGN.md` needs revisiting.
-2. Build `BRINGUP.md` step 4's minimal driver — root-enumerated, no USB, one
-   hardcoded mode. A known-good IddCx baseline to add USB to.
-
-Skipping step 4 to go straight at the full driver on a USB PDO is why these are
-tangled, and it was a mistake.
+The driver speaks GUD to the device over WDF-USB, builds its modeline store
+from what the device advertises, and registers an IddCx adapter against a USB
+PDO. **No monitor appears in Display Settings yet.** The next step is
+asynchronous: IddCx calls `EvtIddCxAdapterInitFinished`, which runs
+`IddCxMonitorCreate` and `IddCxMonitorArrival`. That is where to look next, and
+it has a log line in it already.
 
 ### Fixed, and worth not repeating
 
-All four originally-listed semantic bugs are fixed: the context lookup in every
-callback now goes through `AdapterContext`/`MonitorContext` back-pointers
+Six blockers, none of which a compiler can see and none of which the failure
+names. In the order they were hit:
+
+1. **`EvtIddCxParseMonitorDescription` is mandatory.** Without it
+   `IddCxDeviceInitConfig` fails `STATUS_INVALID_PARAMETER`. A driver with no
+   EDID still has to supply it — return zero modes and succeed.
+2. **UMDF 2.33 is a Windows 11 framework.** On Windows 10 19045 it compiles,
+   signs and installs and then cannot load. 2.31 is the ceiling there, and the
+   build has to move with the INF: headers from `Include\wdf\umdf\2.31`, stub
+   from `Lib\wdf\umdf\x64\2.31`.
+3. **`Include = WUDFRD.inf` / `Needs = WUDFRD.NT` is what the documentation
+   shows and WUDFRD.inf does not exist on Windows 10 19045.** Register the
+   reflector explicitly: `AddService = WUDFRd,0x000001fa,...`.
+4. **`UmdfDispatcher` belongs in the `.NT.Wdf` section**, not the service
+   install section. In the wrong section nothing reads it, and
+   `WdfUsbTargetDeviceCreate` then fails `STATUS_INVALID_PARAMETER` — which is
+   exactly what its documentation warns about. This is what cost the most: with
+   the directive inert, changing its *value* between `WinUsb` and `NativeUSB`
+   naturally changed nothing, which made the dispatcher look innocent.
+5. **USB targets are created in `EvtDevicePrepareHardware`**, not
+   `EvtDriverDeviceAdd`. Correct per WDF regardless of the above.
+6. **`pFirmwareVersion` and `pHardwareVersion` in `IDDCX_ENDPOINT_DIAGNOSTIC_INFO`
+   are not optional.** Null, and `IddCxAdapterInitAsync` refuses the caps
+   without saying which field. Point both at one `IDDCX_ENDPOINT_VERSION` with
+   `Size` and `MajorVer` set, as the `IndirectDisplay` sample does.
+
+Also fixed: all four originally-listed semantic bugs. The context lookup in
+every callback goes through `AdapterContext`/`MonitorContext` back-pointers
 attached via `ObjectAttributes`, the device context has an `EvtCleanupCallback`
 so the frame thread is joined, and adapter re-initialisation on resume is
-refused. Alongside those, found by building and running rather than by reading:
+refused.
 
-- `EvtIddCxParseMonitorDescription` is **mandatory**. Without it
-  `IddCxDeviceInitConfig` fails `STATUS_INVALID_PARAMETER` and UMDF reports only
-  "failed to load the driver at level 0".
-- **UMDF 2.33 is a Windows 11 framework.** On Windows 10 19045 it compiles,
-  signs and installs and then cannot load. 2.31 is the ceiling there.
-- `Include = WUDFRD.inf` / `Needs = WUDFRD.NT` is what the documentation shows
-  and **WUDFRD.inf does not exist on Windows 10 19045**. Register the reflector
-  explicitly with `AddService = WUDFRd,0x000001fa,...`.
-- The UMDF log channel that names any of this,
+**Two things that made all six findable**, and both are worth doing before
+touching a UMDF driver again:
+
+- The UMDF log channel that describes a failed load,
   `Microsoft-Windows-DriverFrameworks-UserMode/Operational`, ships **disabled**.
-  Turn it on first: `wevtutil sl <channel> /e:true`.
+  `wevtutil sl <channel> /e:true`. Even then it says only "failed to load the
+  driver at level 0" and an NTSTATUS — "level 0" covers `EvtDriverDeviceAdd`,
+  not just `DriverEntry`, and three cycles went into the wrong function on the
+  strength of that phrase.
+- **The driver logs to a file.** `GudLog()` appends to
+  `C:\ProgramData\gud-windows\driver.log`, opening and closing per line so a
+  killed process still leaves the last one. One deploy with it in place found
+  what three without it had not, and every blocker after that came out in one
+  or two cycles rather than six.
 
 ### Compiled against stubs — the driver
 
