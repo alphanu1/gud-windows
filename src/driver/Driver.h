@@ -172,6 +172,11 @@ struct DeviceContext {
     // RGB332 exists for anything that turns out not to fit.
     uint8_t         Format = GUD_PIXEL_FORMAT_RGB565;
 
+    // Set when there is no USB device beneath this one, which happens only on
+    // the root-enumerated diagnostic INF. The IddCx path then runs against a
+    // hardcoded mode and sends nothing.
+    bool            NoUsb = false;
+
     std::unique_ptr<SwapChainProcessor> Processor;
 };
 

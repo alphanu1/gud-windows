@@ -242,6 +242,23 @@ IDDCX_TARGET_MODE MakeTargetMode(const gud_display_mode_req& m)
     si.vSyncFreq.Numerator   = gud_mode_refresh_mhz(&m);
     si.vSyncFreq.Denominator = 1000;
 
+    // videoStandard = 255 and vSyncFreqDivider = 1, as the IndirectDisplay
+    // sample sets them. Both live in the AdditionalSignalInfo bitfield and both
+    // are zero if the structure is merely zero-initialised, which is what this
+    // did -- and a zero videoStandard was enough for IddCxMonitorArrival to
+    // refuse the mode list with STATUS_INVALID_PARAMETER and name nothing.
+    //
+    // 255 is "other": there is no D3DKMDT video standard for a 15 kHz arcade
+    // raster, and claiming one of the named ones would be a lie.
+    //
+    // The divider is 1 here and 0 on monitor modes -- see MakeMonitorMode. It
+    // divides vSyncFreq to give the rate at which the OS updates the desktop,
+    // so 1 means every field. The header says a target mode's divider cannot be
+    // zero and a monitor mode's must be, which reads as a contradiction until
+    // you notice the two structures are being described in one comment.
+    si.AdditionalSignalInfo.videoStandard    = 255;
+    si.AdditionalSignalInfo.vSyncFreqDivider = 1;
+
     // Interlace: report it, because the sink is a 15 kHz CRT and 480i is the
     // whole point. Note the asymmetry with GUD, which carries rects in the
     // mode's coordinate space with vdisplay = 480 for 480i and lets the device
@@ -280,6 +297,12 @@ IDDCX_MONITOR_MODE MakeMonitorMode(const gud_display_mode_req& m,
     mode.Origin = origin;
     mode.MonitorVideoSignalInfo =
         MakeTargetMode(m).TargetVideoSignalInfo.targetVideoSignalInfo;
+
+    // Zero on a monitor mode, where MakeTargetMode leaves 1. The header is
+    // explicit that a monitor mode's vSyncFreqDivider has to be zero; the
+    // divider only means anything for a target mode, where it says how often
+    // the OS refreshes the desktop relative to the signal.
+    mode.MonitorVideoSignalInfo.AdditionalSignalInfo.vSyncFreqDivider = 0;
     return mode;
 }
 
@@ -471,11 +494,39 @@ static NTSTATUS EvtIddCxAdapterInitFinished(
     MonitorGetContext(created.MonitorObject)->Device = ctx;
     ctx->Monitor = created.MonitorObject;
 
-    GudLog("AdapterInitFinished: monitor created, calling arrival");
-    IDARG_OUT_MONITORARRIVAL arrival{};
-    NTSTATUS astatus = IddCxMonitorArrival(ctx->Monitor, &arrival);
-    GudLog("AdapterInitFinished: IddCxMonitorArrival -> 0x%08X", (unsigned)astatus);
-    return astatus;
+    // DIAGNOSTIC: announce the monitor off the start path, not on it.
+    //
+    // Everything in IDDCX_MONITOR_INFO now matches the working sample and
+    // IddCxMonitorArrival still returns STATUS_INVALID_PARAMETER, so the
+    // remaining difference is not what is being announced but when.
+    //
+    // This runs inside EvtDeviceSelfManagedIoInit, which is part of the PnP
+    // start sequence -- the device does not reach status=OK until after it
+    // returns. Arrival asks the OS to enumerate a child monitor device, and
+    // doing that against a parent whose start IRP is still in flight is a
+    // plausible way to be told the parameter is invalid. The IndirectDisplay
+    // sample never meets this: a root-enumerated software device has no real
+    // start to be in the middle of.
+    //
+    // A detached thread with a delay is not how this should be done -- a WDF
+    // timer is -- but it answers the question in one deploy, which is what is
+    // wanted before building the right mechanism around a guess.
+    GudLog("AdapterInitFinished: monitor created, deferring arrival off the start path");
+
+    IDDCX_MONITOR mon = ctx->Monitor;
+    std::thread([mon]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+        IDARG_OUT_MONITORARRIVAL arrival{};
+        NTSTATUS s = IddCxMonitorArrival(mon, &arrival);
+        GudLog("DeferredArrival: IddCxMonitorArrival -> 0x%08X", (unsigned)s);
+        if (NT_SUCCESS(s))
+            GudLog("DeferredArrival: OsAdapterLuid=%08X:%08X OsTargetId=%u",
+                   (unsigned)arrival.OsAdapterLuid.HighPart,
+                   (unsigned)arrival.OsAdapterLuid.LowPart,
+                   arrival.OsTargetId);
+    }).detach();
+
+    return STATUS_SUCCESS;
 }
 
 // Parse a monitor description into modes.
@@ -743,6 +794,16 @@ static NTSTATUS EvtDevicePrepareHardware(WDFDEVICE device, WDFCMRESLIST, WDFCMRE
     GudLog("EvtDevicePrepareHardware: entered");
     NTSTATUS status = ctx->Transport.Init(device);
     GudLog("EvtDevicePrepareHardware: Transport.Init -> 0x%08X", (unsigned)status);
+
+    // A failure here is fatal on the real device and expected on the
+    // root-enumerated diagnostic one, where there is no USB beneath us at all.
+    // Carry on without a transport in that case: the IddCx path is what is
+    // being tested and it does not need pixels to reach anything.
+    if (!NT_SUCCESS(status)) {
+        GudLog("EvtDevicePrepareHardware: no USB -- continuing without a transport");
+        ctx->NoUsb = true;
+        return STATUS_SUCCESS;
+    }
     return status;
 }
 
@@ -829,6 +890,23 @@ static NTSTATUS EvtDeviceD0Entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE)
 
     gud_transport t{};
     ctx->Transport.Fill(&t);
+
+    if (ctx->NoUsb) {
+        // Root-enumerated diagnostic: no device to probe. One hardcoded mode,
+        // which is what BRINGUP step 4's minimal driver was to report.
+        GudLog("D0Entry: no USB, using one hardcoded 640x480p60");
+        modeline_store_reset(&ctx->Modes);
+        gud_display_mode_req m{};
+        m.clock = 25175;
+        m.hdisplay = 640; m.hsync_start = 656; m.hsync_end = 752; m.htotal = 800;
+        m.vdisplay = 480; m.vsync_start = 490; m.vsync_end = 492; m.vtotal = 525;
+        m.flags = GUD_DISPLAY_MODE_FLAG_NHSYNC | GUD_DISPLAY_MODE_FLAG_NVSYNC |
+                  GUD_DISPLAY_MODE_FLAG_PREFERRED;
+        modeline_store_add(&ctx->Modes, &m, "diag", 1);
+        g_ParseStore = &ctx->Modes;
+        GudLog("D0Entry: store has %u modes", ctx->Modes.n);
+        return STATUS_SUCCESS;
+    }
 
     GudLog("D0Entry: probing device over WDF-USB");
     if (int err = gud_probe(&ctx->Gud, &t)) {

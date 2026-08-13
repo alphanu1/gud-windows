@@ -1,0 +1,93 @@
+; SPDX-License-Identifier: MIT
+;
+; GudDisplayRoot.inf -- the same driver, root-enumerated, with no USB.
+;
+; This is BRINGUP.md step 4's minimal driver, built out of the real one rather
+; than as a separate scaffold: identical binary, identical IddCx code path, the
+; only difference being that it binds to a root-enumerated software device
+; instead of a USB PDO. That is the last untested difference between this
+; driver and the IndirectDisplay sample, which works.
+;
+; The driver detects the absence of USB and skips gud_probe(), reporting one
+; hardcoded 640x480p60 mode instead. So if a monitor appears here and not on
+; the USB device, the fault is the PDO; if it fails here too, the fault is in
+; this driver's IddCx usage and has nothing to do with USB.
+;
+; Install with devcon, which pnputil cannot do -- root devices have no bus to
+; enumerate them:
+;
+;     devcon install GudDisplayRoot.inf root\gudroot
+;     devcon remove root\gudroot
+;
+; Diagnostic only. Nothing here ships.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Display
+ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+ClassVer    = 2.0
+Provider    = %Provider%
+CatalogFile = GudDisplayRoot.cat
+DriverVer   = 08/12/2026,1.1.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%Provider% = Devices, NTamd64
+
+[Devices.NTamd64]
+%DeviceName% = GudRoot_Install, root\gudroot
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+GudDisplay.dll = 1
+
+[DestinationDirs]
+UMDriverCopy = 12,UMDF
+
+[GudRoot_Install.NT]
+CopyFiles = UMDriverCopy
+
+[GudRoot_Install.NT.Services]
+AddService = WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[WUDFRD_ServiceInstall]
+DisplayName   = "Windows Driver Foundation - User-mode Driver Framework Reflector"
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\WUDFRd.sys
+
+; Same IndirectKmd upper filter as the USB variant -- without it IddCx never
+; calls EvtIddCxAdapterInitFinished at all, which was established the hard way.
+[GudRoot_Install.NT.HW]
+AddReg = GudRoot_HardwareDeviceSettings
+
+[GudRoot_HardwareDeviceSettings]
+HKR,,"UpperFilters",0x00010000,"IndirectKmd"
+HKR,,Security,,"D:P(A;;GA;;;WD)"
+
+[GudRoot_Install.NT.Wdf]
+UmdfService              = GudDisplay, GudRoot_Install_Service
+UmdfServiceOrder         = GudDisplay
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfFileObjectPolicy     = AllowNullAndUnknownFileObjects
+UmdfDeviceObjectPolicy   = AllowNullAndUnknownFileObjects
+UmdfHostProcessSharing   = ProcessSharingDisabled
+UmdfImpersonationLevel   = Identification
+
+; No UmdfDispatcher: there is no USB device under this one to dispatch to.
+
+[GudRoot_Install_Service]
+UmdfLibraryVersion = 2.31.0
+ServiceBinary      = %12%\UMDF\GudDisplay.dll
+UmdfExtensions     = IddCx0102
+
+[UMDriverCopy]
+GudDisplay.dll
+
+[Strings]
+Provider   = "gud-windows"
+DeviceName = "GUD display (root-enumerated diagnostic)"
+DiskName   = "GUD Display Diagnostic Disk"
