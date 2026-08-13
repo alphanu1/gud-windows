@@ -57,6 +57,7 @@
 #include <wrl/client.h>
 
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <atomic>
 #include <vector>
@@ -167,6 +168,20 @@ struct DeviceContext {
     gud_device      Gud{};
     modeline_store  Modes{};
 
+    // The device's own advertised list, kept apart from Modes so the INI can be
+    // re-read without asking the device again. GUD sends GET_CONNECTOR_MODES
+    // once during enumeration and the Linux driver never repeats it; re-probing
+    // over ep0 while the bulk pipe is streaming is not something to do on a
+    // timer just to pick up an edited text file.
+    modeline_store  DeviceModes{};
+
+    // Watches modelines.ini so a mode added while running is picked up without
+    // a replug. Period is a compromise: long enough not to stat a file
+    // pointlessly, short enough that saving the INI and looking at Display
+    // Settings feels immediate.
+    WDFTIMER        ModeWatch = nullptr;
+    ULONGLONG       IniStamp  = 0;
+
     // Formats we will negotiate, best first. RGB565 before RGB332 because the
     // depth is worth more than the bandwidth at every mode this device runs;
     // RGB332 exists for anything that turns out not to fit.
@@ -213,5 +228,8 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(MonitorContext, MonitorGetContext);
 // tell IddCx the monitor's mode list changed. Called at start and whenever the
 // device raises GUD_CONNECTOR_STATUS_CHANGED.
 NTSTATUS ReloadModes(DeviceContext* ctx);
+
+// Starts the periodic check on modelines.ini. Safe to call more than once.
+NTSTATUS StartModeWatch(DeviceContext* ctx);
 
 } // namespace gudwin

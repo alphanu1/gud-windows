@@ -196,6 +196,10 @@ namespace {
 // operating both should not have to learn two spellings.
 const char* kIniPath = "C:\\ProgramData\\gud-windows\\modelines.ini";
 
+// Where the driver writes what it is actually running, for anything that needs
+// the real timings rather than the ones Windows reports. See WriteActiveModes.
+const char* kActivePath = "C:\\ProgramData\\gud-windows\\modes.active";
+
 // The store, reachable from EvtIddCxParseMonitorDescription.
 //
 // That callback is handed a description and a mode buffer and nothing else --
@@ -208,6 +212,22 @@ const char* kIniPath = "C:\\ProgramData\\gud-windows\\modelines.ini";
 // here" says as much. A second GUD device on one machine needs this replaced
 // along with the rest of that assumption.
 modeline_store* g_ParseStore = nullptr;
+
+// Guards the store, which stopped being written once at start the moment the
+// INI could be re-read while running. The mode-watch timer rewrites it in
+// place; the IddCx callbacks read it. Both run at passive level on different
+// threads, so a commit could otherwise walk a store mid-rebuild -- and the
+// thing it would come away with is a set of porches, which go to a deflection
+// circuit.
+//
+// File-scope for the same reason g_ParseStore is: the callback that needs it
+// most has no handle to reach a device by.
+//
+// Nothing may hold this across a call into IddCx or into the device. IddCx
+// answers UpdateModes by calling straight back into the mode callbacks, which
+// take it, and gud_set_state is USB I/O with a timeout on it. Copy out what is
+// needed, release, then call.
+std::mutex g_StoreLock;
 
 IDDCX_TARGET_MODE MakeTargetMode(const gud_display_mode_req& m)
 {
@@ -314,66 +334,305 @@ IDDCX_MONITOR_MODE MakeMonitorMode(const gud_display_mode_req& m,
 
 } // namespace
 
-NTSTATUS gudwin::ReloadModes(DeviceContext* ctx)
+// Last write time of the INI, or 0 if it is not there. Not there is ordinary:
+// a machine with no per-game modelines runs on the device's list alone.
+static ULONGLONG IniLastWrite()
 {
-    modeline_store_reset(&ctx->Modes);
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExA(kIniPath, GetFileExInfoStandard, &fad))
+        return 0;
+    ULARGE_INTEGER t;
+    t.LowPart  = fad.ftLastWriteTime.dwLowDateTime;
+    t.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+    return t.QuadPart;
+}
 
-    // Device list first, INI second, so a hand-written modeline overrides an
-    // advertised one with the same geometry and rate. Someone who wrote out a
-    // modeline meant it.
-    if (gud_read_modes(&ctx->Gud) != 0)
-        return STATUS_DEVICE_DATA_ERROR;
-    modeline_store_load_device(&ctx->Modes, &ctx->Gud);
+// The device's first hardware id, as ASCII. Empty if it cannot be had.
+//
+// This is what tells a reader which device the published mode list belongs to.
+// EnumDisplayDevices reports the same string as the display adapter's DeviceID
+// -- USB\VID_1D50&PID_614D&REV_0100 for the board this was brought up on -- so
+// a tool holding one can match it against the other, which is the only thing
+// separating this display from any other USB-attached one on the machine.
+static void QueryHardwareId(WDFDEVICE device, char* out, size_t len)
+{
+    out[0] = '\0';
+
+    WCHAR buf[256];
+    ULONG got = 0;
+    NTSTATUS s = WdfDeviceQueryProperty(device, DevicePropertyHardwareID,
+                                        sizeof(buf), buf, &got);
+    if (!NT_SUCCESS(s) || got < sizeof(WCHAR))
+        return;
+
+    // A REG_MULTI_SZ, most specific first. The first entry is the one that
+    // carries the revision and the one EnumDisplayDevices echoes.
+    buf[(got / sizeof(WCHAR)) - 1] = L'\0';
+    WideCharToMultiByte(CP_ACP, 0, buf, -1, out, (int)len, nullptr, nullptr);
+    out[len - 1] = '\0';
+}
+
+// Publish the active store as a file, in the same spelling the INI uses.
+//
+// Windows describes this display's modes badly and there is no way to fix that
+// from here: an interlaced mode reaches any application as progressive, so a
+// 480i timing reads as 480p and its line rate as 31 kHz rather than 15.75. Any
+// tool reasoning about whether a mode suits a 15 kHz CRT -- Switchres is the
+// one this project exists for -- will rule out the modes it most wants.
+//
+// So the driver writes down what it actually has. Same syntax as the INI it
+// reads, so one parser covers both, and readable enough to be worth having
+// when a mode does not behave.
+//
+// Written on every rebuild, so it tracks the INI. Best-effort: nothing here
+// fails a mode load, and a tool that cannot read it is no worse off than one
+// that never looked.
+static void WriteActiveModes(const DeviceContext* ctx)
+{
+    FILE* f = nullptr;
+    if (fopen_s(&f, kActivePath, "w") || !f)
+        return;
+
+    fprintf(f, "; gud-windows active mode list -- generated, do not edit.\n");
+    fprintf(f, "; The interlace flag here is authoritative. Windows reports\n");
+    fprintf(f, "; every one of these modes as progressive.\n");
+
+    // Which device this list belongs to. A reader must check it rather than
+    // assume the file describes whatever display it happens to be looking at:
+    // more than one USB-attached display can exist on a machine, and only one
+    // of them is this one.
+    char hwid[128];
+    QueryHardwareId(ctx->Device, hwid, sizeof hwid);
+    if (hwid[0])
+        fprintf(f, "; device = %s\n", hwid);
+
+    fprintf(f, "[modelines]\n");
+
+    for (unsigned i = 0; i < ctx->Modes.n; i++) {
+        char line[256];
+        if (modeline_format(&ctx->Modes.e[i].mode, ctx->Modes.e[i].name,
+                            line, sizeof line) == 0)
+            fprintf(f, "%s\n", line);
+    }
+    fclose(f);
+}
+
+// Rebuild Modes from the cached device list plus whatever the INI says now.
+//
+// Device list first, INI second, so a hand-written modeline overrides an
+// advertised one with the same geometry and rate. Someone who wrote out a
+// modeline meant it.
+static NTSTATUS RebuildStore(DeviceContext* ctx)
+{
+    std::lock_guard<std::mutex> lk(g_StoreLock);
+
+    modeline_store_reset(&ctx->Modes);
+    for (unsigned i = 0; i < ctx->DeviceModes.n; i++)
+        modeline_store_add(&ctx->Modes, &ctx->DeviceModes.e[i].mode,
+                           ctx->DeviceModes.e[i].name, 1);
     modeline_store_load_ini(&ctx->Modes, kIniPath);
 
     // Publish it for EvtIddCxParseMonitorDescription, which has no handle to
     // reach it by. Set after loading so the callback never sees a half-filled
     // store, and set on every reload so it tracks the INI.
     g_ParseStore = &ctx->Modes;
+    ctx->IniStamp = IniLastWrite();
+    WriteActiveModes(ctx);
 
-    if (ctx->Modes.n == 0)
+    return ctx->Modes.n ? STATUS_SUCCESS : STATUS_DEVICE_DATA_ERROR;
+}
+
+NTSTATUS gudwin::ReloadModes(DeviceContext* ctx)
+{
+    // The only place that asks the device. GUD sends its mode list once during
+    // enumeration, so this belongs on the start path and nowhere else; every
+    // later reload works from the cached copy.
+    if (gud_read_modes(&ctx->Gud) != 0)
         return STATUS_DEVICE_DATA_ERROR;
+    modeline_store_reset(&ctx->DeviceModes);
+    modeline_store_load_device(&ctx->DeviceModes, &ctx->Gud);
 
-    // IddCx reads the mode list once per monitor arrival. Growing it later
-    // means taking the monitor away and bringing it back, which is the same
-    // constraint GUD has on the device side: GET_CONNECTOR_MODES is asked once
-    // during enumeration. Both ends re-probe rather than grow.
-    if (ctx->Monitor) {
-        IddCxMonitorDeparture(ctx->Monitor);
-        ctx->Monitor = nullptr;
+    return RebuildStore(ctx);
+}
+
+// Push the current store to the OS as the monitor's target mode list.
+//
+// This is what makes a mode added to the INI appear without a replug. IddCx
+// reads the mode list once at monitor arrival, so the alternative is departure
+// and arrival -- which tears down the swap chain, blanks the CRT and moves
+// every window off the display. IddCxMonitorUpdateModes exists precisely so a
+// driver whose capabilities change does not have to do that.
+static NTSTATUS PublishModes(DeviceContext* ctx, IDDCX_UPDATE_REASON reason)
+{
+    if (!ctx->Monitor)
+        return STATUS_INVALID_DEVICE_STATE;
+
+    std::vector<IDDCX_TARGET_MODE> modes;
+    {
+        std::lock_guard<std::mutex> lk(g_StoreLock);
+        modes.reserve(ctx->Modes.n);
+        for (unsigned i = 0; i < ctx->Modes.n; i++)
+            modes.push_back(MakeTargetMode(ctx->Modes.e[i].mode));
     }
-    return STATUS_SUCCESS;
+    if (modes.empty())
+        return STATUS_INVALID_DEVICE_STATE;
+
+    IDARG_IN_UPDATEMODES in{};
+    in.Reason          = reason;
+    in.TargetModeCount = (UINT)modes.size();
+    in.pTargetModes    = modes.data();
+
+    NTSTATUS s = IddCxMonitorUpdateModes(ctx->Monitor, &in);
+    GudLog("PublishModes: %u modes -> 0x%08X", (unsigned)modes.size(), (unsigned)s);
+    return s;
+}
+
+static NTSTATUS CreateAndArriveMonitor(DeviceContext* ctx, IDDCX_ADAPTER adapter);
+
+// A value that changes whenever the set of modes changes.
+//
+// Counting them is not enough, and getting that wrong is silent: a tool that
+// replaces one generated modeline with another -- which is exactly what a
+// Switchres backend does between games -- leaves the count alone while
+// changing the geometry. The monitor is then never re-enumerated, Windows goes
+// on offering the mode that no longer exists, and the new one cannot be
+// selected. Observed, with a store going 3 -> 3 across a 384x224 becoming
+// 640x480.
+//
+// Everything that identifies a timing goes in, porches included, so editing a
+// modeline in place re-enumerates too.
+static uint64_t StoreSignature(const modeline_store* s)
+{
+    uint64_t h = 1469598103934665603ull;         // FNV-1a
+    auto mix = [&h](uint32_t v) {
+        for (int i = 0; i < 4; i++) {
+            h ^= (uint8_t)(v >> (i * 8));
+            h *= 1099511628211ull;
+        }
+    };
+
+    for (unsigned i = 0; i < s->n; i++) {
+        const auto& m = s->e[i].mode;
+        mix(m.clock);
+        mix(m.hdisplay); mix(m.hsync_start); mix(m.hsync_end); mix(m.htotal);
+        mix(m.vdisplay); mix(m.vsync_start); mix(m.vsync_end); mix(m.vtotal);
+        mix(m.flags);
+    }
+    return h;
+}
+
+// Periodic: has the INI changed, and if so does the OS need telling?
+static void EvtModeWatchTimer(WDFTIMER timer)
+{
+    auto* ctx = DeviceGetContext((WDFDEVICE)WdfTimerGetParentObject(timer));
+    if (!ctx || !ctx->Monitor)
+        return;
+
+    ULONGLONG now = IniLastWrite();
+    if (now == ctx->IniStamp)
+        return;
+
+    unsigned before = ctx->Modes.n;
+    uint64_t sig_before = StoreSignature(&ctx->Modes);
+    NTSTATUS s = RebuildStore(ctx);
+    uint64_t sig_after = StoreSignature(&ctx->Modes);
+
+    {
+        std::lock_guard<std::mutex> lk(g_StoreLock);
+        GudLog("ModeWatch: modelines.ini changed -- store %u -> %u, 0x%08X",
+               before, ctx->Modes.n, (unsigned)s);
+        for (unsigned i = 0; i < ctx->Modes.n; i++) {
+            const auto& m = ctx->Modes.e[i].mode;
+            GudLog("    [%u] %s %ux%u%s clk=%u h %u/%u/%u/%u v %u/%u/%u/%u",
+                   i, ctx->Modes.e[i].name, m.hdisplay, m.vdisplay,
+                   (m.flags & GUD_DISPLAY_MODE_FLAG_INTERLACE) ? "i" : "p", m.clock,
+                   m.hdisplay, m.hsync_start, m.hsync_end, m.htotal,
+                   m.vdisplay, m.vsync_start, m.vsync_end, m.vtotal);
+        }
+    }
+    if (!NT_SUCCESS(s))
+        return;
+
+    // Two steps, because they update two different lists.
+    //
+    // IddCxMonitorUpdateModes replaces the monitor's *target* modes -- the
+    // timings the driver can drive -- and takes effect at once, without
+    // disturbing anything on screen. Existing modes whose porches were edited
+    // are corrected by this alone.
+    //
+    // It does not touch the monitor's own mode list, which is what Windows
+    // builds the resolution list in Display Settings from. That list is read
+    // once, from EvtIddCxParseMonitorDescription, at arrival. So a genuinely
+    // new geometry is published here and still cannot be selected: verified,
+    // with UpdateModes returning STATUS_SUCCESS and EnumDisplaySettings
+    // continuing to offer only the modes present at arrival.
+    //
+    // Re-arriving the monitor is what makes it selectable. It is disruptive --
+    // the swap chain goes, the CRT blanks, and windows on the display move --
+    // so it is done only when the set of modes actually changed, not on every
+    // INI write. Touching the file without changing a timing costs nothing.
+    // OTHER as the reason, because none of the named ones fit: the list did not
+    // change because of power, bandwidth or configuration. Someone wrote a
+    // modeline down.
+    PublishModes(ctx, IDDCX_UPDATE_REASON_OTHER);
+
+    if (sig_after != sig_before && ctx->Adapter) {
+        GudLog("ModeWatch: mode set changed, re-enumerating the monitor");
+        if (ctx->Monitor) {
+            IddCxMonitorDeparture(ctx->Monitor);
+            ctx->Monitor = nullptr;
+        }
+        CreateAndArriveMonitor(ctx, ctx->Adapter);
+    }
+}
+
+NTSTATUS gudwin::StartModeWatch(DeviceContext* ctx)
+{
+    if (ctx->ModeWatch)
+        return STATUS_SUCCESS;
+
+    WDF_TIMER_CONFIG cfg;
+    WDF_TIMER_CONFIG_INIT_PERIODIC(&cfg, EvtModeWatchTimer, 2000);
+
+    // Automatic serialisation off: it serialises the timer against the parent
+    // device's other callbacks, and this driver's other callbacks come from
+    // IddCx rather than WDF, so there is nothing there for WDF to serialise
+    // against. g_StoreLock is what actually guards the shared state.
+    cfg.AutomaticSerialization = FALSE;
+
+    WDF_OBJECT_ATTRIBUTES attrs;
+    WDF_OBJECT_ATTRIBUTES_INIT(&attrs);
+    attrs.ParentObject = ctx->Device;
+
+    // ExecutionLevel is deliberately left inherited. Asking for
+    // WdfExecutionLevelPassive here fails with STATUS_NOT_SUPPORTED, because
+    // the WDFDEVICE this hangs off never declared a level either, so it
+    // inherits the driver's -- dispatch -- and a passive child of a dispatch
+    // parent is not a combination WDF allows. The callback reads a file, so
+    // passive is what it needs; it gets it regardless, because UMDF has no
+    // dispatch level to run at. Every callback in a UMDF host is passive and
+    // ExecutionLevel is bookkeeping inherited from the KMDF object model.
+
+    NTSTATUS s = WdfTimerCreate(&cfg, &attrs, &ctx->ModeWatch);
+    GudLog("StartModeWatch: WdfTimerCreate -> 0x%08X", (unsigned)s);
+    if (NT_SUCCESS(s))
+        WdfTimerStart(ctx->ModeWatch, WDF_REL_TIMEOUT_IN_MS(2000));
+    return s;
 }
 
 // ===========================================================================
 // IddCx callbacks
 // ===========================================================================
 
-_Use_decl_annotations_
-static NTSTATUS EvtIddCxAdapterInitFinished(
-    IDDCX_ADAPTER adapter, const IDARG_IN_ADAPTER_INIT_FINISHED* args)
+// Create the monitor and announce it.
+//
+// Factored out of EvtIddCxAdapterInitFinished because it runs twice: once when
+// the adapter first comes up, and again whenever the modeline store changes
+// shape. A monitor's mode list is read once, at arrival, so a mode added to
+// the INI while running only reaches Windows by taking the monitor away and
+// bringing a new one back.
+static NTSTATUS CreateAndArriveMonitor(DeviceContext* ctx, IDDCX_ADAPTER adapter)
 {
-    // Log before touching anything. The previous version dereferenced the
-    // adapter context on its first line, so a context that was not attached
-    // would fault here and look exactly like the callback never being called
-    // -- no log line either way. Distinguishing those two is the whole point.
-    GudLog("AdapterInitFinished: CALLED. AdapterInitStatus=0x%08X",
-           (unsigned)args->AdapterInitStatus);
-
-    if (!NT_SUCCESS(args->AdapterInitStatus))
-        return args->AdapterInitStatus;
-
-    auto* actx = AdapterGetContext(adapter);
-    GudLog("AdapterInitFinished: AdapterGetContext -> %p", (void*)actx);
-    if (!actx || !actx->Device) {
-        // IddCxAdapterInitAsync is asynchronous, so this can in principle run
-        // before D0Entry has written the back-pointer. Say so rather than
-        // dereferencing null.
-        GudLog("AdapterInitFinished: adapter context not populated yet");
-        return STATUS_INVALID_DEVICE_STATE;
-    }
-    auto* ctx = actx->Device;
-
     // Create the monitor. Connector index 0; see gud_probe().
     IDDCX_MONITOR_INFO info{};
     info.Size = sizeof(info);
@@ -516,46 +775,71 @@ static NTSTATUS EvtIddCxAdapterInitFinished(
 
     IDARG_OUT_MONITORCREATE created{};
     NTSTATUS status = IddCxMonitorCreate(adapter, &create, &created);
-    GudLog("AdapterInitFinished: IddCxMonitorCreate -> 0x%08X", (unsigned)status);
+    GudLog("CreateAndArriveMonitor: IddCxMonitorCreate -> 0x%08X", (unsigned)status);
     if (!NT_SUCCESS(status))
         return status;
 
     MonitorGetContext(created.MonitorObject)->Device = ctx;
     ctx->Monitor = created.MonitorObject;
 
-    // DIAGNOSTIC: announce the monitor off the start path, not on it.
+    // Arrival off the start path.
     //
-    // Everything in IDDCX_MONITOR_INFO now matches the working sample and
-    // IddCxMonitorArrival still returns STATUS_INVALID_PARAMETER, so the
-    // remaining difference is not what is being announced but when.
+    // EvtIddCxAdapterInitFinished runs inside EvtDeviceSelfManagedIoInit, which
+    // is part of the PnP start sequence -- the device does not reach status=OK
+    // until it returns. Arrival asks the OS to enumerate a child monitor
+    // device, and doing that against a parent whose start IRP is still in
+    // flight is not something to do inline. The IndirectDisplay sample never
+    // meets this, a root-enumerated software device having no real start to be
+    // in the middle of.
     //
-    // This runs inside EvtDeviceSelfManagedIoInit, which is part of the PnP
-    // start sequence -- the device does not reach status=OK until after it
-    // returns. Arrival asks the OS to enumerate a child monitor device, and
-    // doing that against a parent whose start IRP is still in flight is a
-    // plausible way to be told the parameter is invalid. The IndirectDisplay
-    // sample never meets this: a root-enumerated software device has no real
-    // start to be in the middle of.
-    //
-    // A detached thread with a delay is not how this should be done -- a WDF
-    // timer is -- but it answers the question in one deploy, which is what is
-    // wanted before building the right mechanism around a guess.
-    GudLog("AdapterInitFinished: monitor created, deferring arrival off the start path");
+    // A detached thread with a fixed sleep is not how this should be done -- a
+    // WDF timer is -- and now that StartModeWatch has demonstrated a working
+    // WDF timer in this driver, there is no longer an excuse for it.
+    GudLog("CreateAndArriveMonitor: monitor created, deferring arrival");
 
     IDDCX_MONITOR mon = ctx->Monitor;
-    std::thread([mon]() {
+    std::thread([mon, ctx]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(2000));
         IDARG_OUT_MONITORARRIVAL arrival{};
         NTSTATUS s = IddCxMonitorArrival(mon, &arrival);
         GudLog("DeferredArrival: IddCxMonitorArrival -> 0x%08X", (unsigned)s);
-        if (NT_SUCCESS(s))
+        if (NT_SUCCESS(s)) {
             GudLog("DeferredArrival: OsAdapterLuid=%08X:%08X OsTargetId=%u",
                    (unsigned)arrival.OsAdapterLuid.HighPart,
                    (unsigned)arrival.OsAdapterLuid.LowPart,
                    arrival.OsTargetId);
+            // Only once there is a monitor. Before arrival there is nothing
+            // for the watcher to update.
+            StartModeWatch(ctx);
+        }
     }).detach();
 
     return STATUS_SUCCESS;
+}
+
+_Use_decl_annotations_
+static NTSTATUS EvtIddCxAdapterInitFinished(
+    IDDCX_ADAPTER adapter, const IDARG_IN_ADAPTER_INIT_FINISHED* args)
+{
+    // Log before touching anything. The previous version dereferenced the
+    // adapter context on its first line, so a context that was not attached
+    // would fault here and look exactly like the callback never being called
+    // -- no log line either way. Distinguishing those two is the whole point.
+    GudLog("AdapterInitFinished: CALLED. AdapterInitStatus=0x%08X",
+           (unsigned)args->AdapterInitStatus);
+
+    if (!NT_SUCCESS(args->AdapterInitStatus))
+        return args->AdapterInitStatus;
+
+    auto* actx = AdapterGetContext(adapter);
+    if (!actx || !actx->Device) {
+        // IddCxAdapterInitAsync is asynchronous, so this can in principle run
+        // before D0Entry has written the back-pointer. Say so rather than
+        // dereferencing null.
+        GudLog("AdapterInitFinished: adapter context not populated yet");
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    return CreateAndArriveMonitor(actx->Device, adapter);
 }
 
 // Parse a monitor description into modes.
@@ -593,6 +877,8 @@ static NTSTATUS EvtIddCxParseMonitorDescription(
     // Two-pass, as the argument pair implies: an input count of zero asks how
     // many there are, anything else is the buffer to fill.
     GudLog("ParseMonitorDescription: CALLED. inCount=%u store=%p", in->MonitorModeBufferInputCount, (void*)g_ParseStore);
+    std::lock_guard<std::mutex> lk(g_StoreLock);
+
     auto* store = g_ParseStore;
     if (!store) {
         out->MonitorModeBufferOutputCount = 0;
@@ -633,7 +919,8 @@ static NTSTATUS EvtIddCxMonitorGetDefaultModes(
     IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* out)
 {
     auto* ctx = MonitorGetContext(monitor)->Device;
-    GudLog("  monitor mode callback: entered");
+    std::lock_guard<std::mutex> lk(g_StoreLock);
+    GudLog("GetDefaultDescriptionModes: %u modes", ctx->Modes.n);
 
     if (in->DefaultMonitorModeBufferInputCount == 0) {
         out->DefaultMonitorModeBufferOutputCount = ctx->Modes.n;
@@ -659,7 +946,8 @@ static NTSTATUS EvtIddCxMonitorQueryModes(
     IDARG_OUT_QUERYTARGETMODES* out)
 {
     auto* ctx = MonitorGetContext(monitor)->Device;
-    GudLog("  monitor mode callback: entered");
+    std::lock_guard<std::mutex> lk(g_StoreLock);
+    GudLog("QueryTargetModes: %u modes", ctx->Modes.n);
 
     if (in->TargetModeBufferInputCount == 0) {
         out->TargetModeBufferOutputCount = ctx->Modes.n;
@@ -717,6 +1005,14 @@ static NTSTATUS EvtIddCxAdapterCommitModes(
         // Dropping it costs nothing: two modelines agreeing on clock, both
         // totals and both actives, and differing only in interlace, are not
         // distinguishable from anything Windows hands us here either.
+        // Copied out under the lock, not pointed at: the mode-watch timer can
+        // rewrite the store from another thread, and everything below this
+        // wants a modeline that will not move.
+        gud_display_mode_req chosen{};
+        char chosen_name[32] = { 0 };
+
+        std::unique_lock<std::mutex> lk(g_StoreLock);
+
         const modeline_entry* e = modeline_store_find_exact(
             &ctx->Modes,
             (uint32_t)(sig.pixelRate / 1000),
@@ -760,16 +1056,20 @@ static NTSTATUS EvtIddCxAdapterCommitModes(
             return STATUS_INVALID_PARAMETER;
         }
 
-        GudLog("  modeline %s: %ux%u%s clk=%u h %u/%u/%u/%u v %u/%u/%u/%u",
-               e->name, (unsigned)e->mode.hdisplay, (unsigned)e->mode.vdisplay,
-               (e->mode.flags & GUD_DISPLAY_MODE_FLAG_INTERLACE) ? "i" : "p",
-               (unsigned)e->mode.clock,
-               (unsigned)e->mode.hdisplay, (unsigned)e->mode.hsync_start,
-               (unsigned)e->mode.hsync_end, (unsigned)e->mode.htotal,
-               (unsigned)e->mode.vdisplay, (unsigned)e->mode.vsync_start,
-               (unsigned)e->mode.vsync_end, (unsigned)e->mode.vtotal);
+        chosen = e->mode;
+        strncpy_s(chosen_name, e->name, _TRUNCATE);
+        lk.unlock();
 
-        int err = gud_set_state(&ctx->Gud, &e->mode, ctx->Format);
+        GudLog("  modeline %s: %ux%u%s clk=%u h %u/%u/%u/%u v %u/%u/%u/%u",
+               chosen_name, (unsigned)chosen.hdisplay, (unsigned)chosen.vdisplay,
+               (chosen.flags & GUD_DISPLAY_MODE_FLAG_INTERLACE) ? "i" : "p",
+               (unsigned)chosen.clock,
+               (unsigned)chosen.hdisplay, (unsigned)chosen.hsync_start,
+               (unsigned)chosen.hsync_end, (unsigned)chosen.htotal,
+               (unsigned)chosen.vdisplay, (unsigned)chosen.vsync_start,
+               (unsigned)chosen.vsync_end, (unsigned)chosen.vtotal);
+
+        int err = gud_set_state(&ctx->Gud, &chosen, ctx->Format);
         GudLog("  gud_set_state -> %d", err);
         if (err)
             return STATUS_INVALID_PARAMETER;
