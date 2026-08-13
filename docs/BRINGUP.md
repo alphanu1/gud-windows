@@ -175,17 +175,21 @@ Otherwise, this method may return STATUS_INVALID_PARAMETER." With the directive
 inert, changing its value between `WinUsb` and `NativeUSB` changed nothing,
 which is what made the dispatcher look innocent for several cycles.
 
-**Still to do here:** no monitor appears. `IddCxAdapterInitAsync` returns
-`STATUS_SUCCESS` and `EvtIddCxAdapterInitFinished` is **never called**, so
-`IddCxMonitorCreate` and `IddCxMonitorArrival` never run. The device is
-otherwise entirely healthy: `status=OK`, `problem=0`, no fault anywhere.
+**And the monitor arrives.** This step is closed: a monitor appears in Display
+Settings, is selectable, and the desktop extends onto the CRT.
 
-The callback logs on its first line, before dereferencing the adapter context,
-so this is established rather than inferred — it is not a crash that happens to
-leave no trace. IddCx accepts the adapter and silently does not complete the
-second half of the two-stage creation.
+It took two findings, neither of which the failure named. `EvtIddCxAdapterInitFinished`
+was never called because the INF was missing the `IndirectKmd` upper filter;
+then `IddCxMonitorArrival` refused the mode list because
+`AdditionalSignalInfo.videoStandard` was left at its zero-initialised value.
+Both are written up under *Things that will waste time if you do not know them*
+below, which is where anyone hitting them will be looking.
 
-### What that is not
+The eliminations that came first are kept below, because every one of them was
+a plausible reading of the same silence and none was ever wrong — the plumbing
+they depended on was simply absent.
+
+### What that was not
 
 Each of these was tried and made no difference. They are listed so nobody
 spends the night on them twice.
@@ -204,21 +208,21 @@ symptom — the driver is self-signed, IddCx creates a *graphics* adapter, and
 the graphics stack has stricter trust rules than PnP installation — and it is
 still wrong.
 
-Two things remain untried:
+**The minimal root-enumerated driver settled the shape of the problem.**
+`GudDisplayRoot.inf` builds the same binary against `root\gudroot`, skipping
+`gud_probe()` and reporting one hardcoded mode when there is no USB beneath it.
+Installed with `devcon`, since `pnputil` cannot create root devices. Both
+devices failed at the identical point, which exonerated the USB PDO and put the
+fault squarely in this driver's IddCx usage — where it was. This step asked for
+that driver first and it was skipped, which cost three separate evenings of
+eliminations it would have settled in one run.
 
-1. **The minimal driver at the top of this step.** Root-enumerated, one
-   hardcoded mode, no USB, no GUD. It answers the only question left: does this
-   IddCx usage work at all outside a USB PDO? Everything else is eliminated, so
-   whichever way it goes the answer is informative. This step asked for it
-   first, it was skipped, and that has now cost three separate evenings' worth
-   of eliminations that it would have settled in one run.
-
-2. **`IddCxDebugCtrl`** under `HKLM\System\CurrentControlSet\Control\GraphicsDrivers`,
-   a DWORD bitfield. `0x0001` breaks into the debugger on IddCx error
-   detection, which would name the reason outright. It needs a kernel debugger
-   on a second machine, which is the thing this whole bring-up order exists to
-   avoid — but it is the definitive tool if the minimal driver does not settle
-   it.
+`IddCxDebugCtrl` was never needed:
+`HKLM\System\CurrentControlSet\Control\GraphicsDrivers`, a DWORD bitfield,
+`0x0001` breaking into the debugger on IddCx error detection. It needs a kernel
+debugger on a second machine, which is the thing this bring-up order exists to
+avoid, and it remains the definitive tool if something in this area misbehaves
+again.
 
 Note that IddCx's own WPP provider, `{D92BCB52-FA78-406F-A9A5-2037509FADEA}`,
 captures happily with `logman` -- 31 events during a device restart -- but
@@ -227,12 +231,11 @@ cannot be decoded on Windows 10 19045: WPP information only reaches the public
 `tracepdb` finds no trace entries.
 
 **Proved when:** a monitor appears in Display Settings, is selectable, and can
-be extended onto.
+be extended onto. **Done.**
 
-The minimal root-enumerated driver this step originally called for is no longer
-needed to settle the architecture, but it remains the right tool if the monitor
-path misbehaves: it separates IddCx faults from USB and GUD ones in a single
-run.
+`GudDisplayRoot.inf` stays in the tree. It is no longer needed to settle the
+architecture, but it remains the right tool if the monitor path misbehaves: it
+separates IddCx faults from USB and GUD ones in a single run.
 
 ### Debugging a driver that will not load
 
@@ -265,14 +268,19 @@ evidence.
 
 ## 5. First frame
 
-Turn on the real frame loop. Test-sign and enable test signing:
+Turn on the real frame loop:
 
 ```
-bcdedit /set testsigning on
 pnputil /add-driver GudDisplay.inf /install
 ```
 
-**Proved when:** the desktop is on the CRT.
+Test signing is not required. A self-signed certificate in both `Root` and
+`TrustedPublisher` is enough for a signed package to install and load, and
+`bcdedit /set testsigning on` was tried against the monitor-arrival problem and
+changed nothing.
+
+**Proved when:** the desktop is on the CRT. **Done** — at 648x480i60 and
+632x240p60, each committed from the store with its own porches.
 
 Expect the first version to be slow and to have the wrong idea about damage.
 Measure before changing anything:
@@ -296,27 +304,84 @@ Write `C:\ProgramData\gud-windows\modelines.ini`:
 arcade_224p = ModeLine "384x224@60" 6.700 384 400 432 480 224 227 230 262 -hsync -vsync
 ```
 
-Restart the device (`pnputil /restart-device`, or unplug it) and the mode should
-appear in Display Settings.
+No restart needed. The driver watches the file and picks it up within about two
+seconds, then re-enumerates its monitor so Windows offers the new geometry —
+about four seconds end to end, during which the CRT blanks.
 
 **Proved when:** a mode that was never advertised by the device is selectable
 and produces the right line rate on the CRT.
 
-That is also the point at which a Switchres backend becomes a small piece of
-work rather than a design question: it writes modelines to a known destination
-and asks the device to re-enumerate. The existing Windows backends push timing
-into a graphics driver through a vendor interface and leave nothing behind to
-read, so making this driver the sink rather than a scavenger is the shape that
-already fits.
+**Done.** A Switchres backend exists, on the `gud-backend` branch of
+`alphanu1/switchres`. It writes generated modelines here, waits for the
+re-enumeration, and sets the mode through `ChangeDisplaySettingsEx`; the driver
+looks the modeline up and puts the real porches on the wire. Verified on a
+blitsCRT_Mister against a 15 kHz CRT with `384x224@59.185` and an interlaced
+`640x480@60`, neither of which the device advertises.
+
+Two things that backend had to deal with, both consequences of interlace not
+surviving IddCx — see DESIGN.md:
+
+- Windows reports these modes as progressive, so a 15 kHz monitor preset rules
+  the 480-line ones out of range as if they were 31.5 kHz. The backend reads
+  `modes.active` for the real timings, which is what that file is for.
+- `ChangeDisplaySettingsEx` returns `DISP_CHANGE_BADMODE` for a DEVMODE carrying
+  `DM_INTERLACED`, because Windows has no interlaced mode to match it against.
+  Interlace has to be left out of the mode set, and stays in the modeline.
 
 ---
 
 ## Things that will waste time if you do not know them
 
+**`IndirectKmd` is not optional and is not documented.** An IddCx driver needs
+the `IndirectKmd` upper filter in its INF or the adapter never finishes
+initialising:
+
+```
+[GudDisplay_Install.NT.HW]
+AddReg = GudDisplay_HardwareDeviceSettings
+
+[GudDisplay_HardwareDeviceSettings]
+HKR,,"UpperFilters",0x00010000,"IndirectKmd"
+```
+
+`IndirectKmd.sys` is the kernel half of the indirect display model, the piece
+that joins the device to `dxgkrnl`. Without it `IddCxAdapterInitAsync` returns
+`STATUS_SUCCESS` and the OS has no path to call back on:
+`EvtIddCxAdapterInitFinished` is never invoked, the device sits at `status=OK`
+`problem=0`, and no monitor appears. It is declared in `rdpidd.inf` and absent
+from the `IndirectDisplay` sample's INF, which is why building from the sample
+cannot get you there. Seven other hypotheses were eliminated first; none of them
+were ever wrong, the plumbing they depended on was simply absent.
+
+**`AdditionalSignalInfo.videoStandard` must not be zero.** Zero is what
+zero-initialising `DISPLAYCONFIG_VIDEO_SIGNAL_INFO` leaves, and it is enough for
+`IddCxMonitorArrival` to refuse the mode list with `STATUS_INVALID_PARAMETER`
+and name no field, while `IddCxMonitorCreate` accepts the same monitor happily.
+Use 255, "other" — there is no D3DKMDT video standard for a 15 kHz arcade
+raster. `vSyncFreqDivider` goes with it: 1 on target modes, 0 on monitor modes.
+The header describes both structures in one comment and so appears to
+contradict itself.
+
+**Bump `DriverVer` on every deploy.** Windows will not replace an installed
+driver binary unless the package version increases, and it does not say it has
+declined. Several rounds of testing here measured an older build, including the
+first run of a fix that worked. Any driver iteration loop needs a check that the
+installed binary is the one just built; without it a negative result means
+nothing.
+
 **Session 0.** The driver runs in the UMDF host process in Session 0. `printf`
 goes nowhere, a message box hangs the process, and a debugger has to be
 attached to `WUDFHost.exe`. Use `TraceLoggingWrite` or ETW from the start rather
 than adding it after the first thing goes wrong.
+
+**`WdfTimerCreate` refuses twice, silently, with `STATUS_NOT_SUPPORTED`.**
+`WDF_TIMER_CONFIG_INIT_PERIODIC` leaves `AutomaticSerialization` TRUE, which a
+passive-level timer cannot have. Then `ExecutionLevel`: asking for
+`WdfExecutionLevelPassive` fails if the parent WDFDEVICE never declared a level,
+because it inherits the driver's default of dispatch and WDF does not allow a
+passive child of a dispatch parent. Leave it inherited — every callback in a
+UMDF host runs at passive level regardless, `ExecutionLevel` being bookkeeping
+inherited from the KMDF object model.
 
 **The frame thread must be woken to be stopped.** `~SwapChainProcessor` sets the
 terminate flag and signals the frame event. Without the signal the thread stays

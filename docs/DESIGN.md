@@ -125,16 +125,29 @@ Two sources fill the table:
    advertised one with the same geometry and rate. Someone who wrote out a
    modeline meant it.
 
-The key is `(hdisplay, vdisplay, refresh within 100 mHz, interlace)`. The
-tolerance is not slop: Windows carries refresh as a rational and rounds it in
-several places, and a mode reported at 60000 mHz can come back as 60001. 100 mHz
-is wide enough to survive that and narrow enough that 59.94 and 60.00 stay
-distinct — they are different modelines on a CRT and conflating them is a
-visible fault.
+That is the *fallback* key: `(hdisplay, vdisplay, refresh within
+MODELINE_REFRESH_TOL_MHZ, interlace)`, 20 mHz as it stands. The tolerance is not
+slop — Windows carries refresh as a rational and rounds it in several places, so
+a mode reported at 60000 mHz can come back as 60001 — and it has to stay narrow
+enough that 59.94 and 60.00 remain distinct, since they are different modelines
+on a CRT and conflating them is a visible fault.
 
-`interlace` is part of the key because it cannot be derived. DRM reports a 480i
-mode's `vdisplay` as 480 and so does Windows, so geometry alone cannot
-distinguish 640x480p60 from 640x480i60.
+The primary lookup does not use it. `pixelRate` and `totalSize` come back
+through `EvtIddCxAdapterCommitModes` exactly as the driver supplied them, so
+four of the five identifying numbers are available and the match is exact rather
+than approximate. Only the sync starts and ends are missing, and recovering
+those is the whole reason the store exists.
+
+`interlace` is in the key because it cannot be derived from geometry: DRM
+reports a 480i mode's `vdisplay` as 480 and so does Windows, so nothing
+distinguishes 640x480p60 from 640x480i60 by size alone. It is nonetheless
+passed as don't-care at commit time, because the OS does not give it back —
+see *What Windows cannot express* below.
+
+The same 20 mHz is `modeline_store_add()`'s idea of a duplicate, and there it is
+too loose: two per-game modelines at one geometry less than about 3 kHz of pixel
+clock apart replace each other silently. `modeline_store_find_exact()` can tell
+them apart; only the insert cannot. It is on the list in the README.
 
 ### Why the driver is the sink and not a scavenger
 
@@ -157,7 +170,82 @@ monitor departure and arrival.
 GUD has the identical constraint on the device side — `GET_CONNECTOR_MODES` is
 asked once during USB enumeration and the device raises
 `GUD_CONNECTOR_STATUS_CHANGED` to make a host re-probe rather than growing the
-list in place. Both ends re-probe. `ReloadModes()` does the IddCx half.
+list in place. Both ends re-probe.
+
+The driver watches `modelines.ini` on a WDF timer and rebuilds the store when it
+changes, so a modeline written while the display is running reaches the CRT
+without a replug. That takes two mechanisms, and the first of them looks
+sufficient until it is tried:
+
+- `IddCxMonitorUpdateModes()` replaces the monitor's **target** modes, the
+  timings the driver can drive. It takes effect at once with nothing disturbed
+  on screen, and it is enough on its own to correct the porches of a mode that
+  already exists.
+- It does not touch the monitor's **own** mode list, which is what Windows
+  builds the resolution list from, and that list is read once, at arrival. A
+  genuinely new geometry published this way still cannot be selected — verified,
+  with `UpdateModes` returning `STATUS_SUCCESS` and `EnumDisplaySettings` going
+  on offering only the modes present at arrival.
+
+So a new geometry costs a departure and an arrival. That is disruptive — the
+swap chain goes, the CRT blanks, windows on the display move — so it happens
+only when the mode set actually changed.
+
+**"Actually changed" is a signature over every timing field, not a mode count.**
+Counting them is wrong in the case that matters most: a Switchres backend
+replacing one generated modeline with another between two games leaves the count
+alone while changing the geometry. The monitor is then never re-enumerated,
+Windows keeps offering a mode that no longer exists, and the new one cannot be
+selected. It fails silently and it fails in the normal case.
+
+## What Windows cannot express, and what to do about it
+
+Interlace does not survive IddCx. A target mode set as
+`DISPLAYCONFIG_SCANLINE_ORDERING_INTERLACED` comes back through
+`EvtIddCxAdapterCommitModes()` as `PROGRESSIVE`, and reaches applications the
+same way — `EnumDisplaySettings` reports `dmDisplayFlags` of 0 for a 480i mode.
+The desktop IddCx composites is progressive and the field order is normalised
+away above this driver.
+
+Nothing here can change that, so two things follow.
+
+**Nothing in the driver may key on getting it back.** The commit-time lookup
+passes interlace as don't-care, which costs nothing because pixel clock, both
+totals and both actives already identify a modeline. Keying on it means an
+interlaced modeline never matches, the commit is refused, and IddCx restarts the
+driver in a loop.
+
+**Anything outside the driver would draw the wrong conclusion.** 648x480i60
+presents as 480p at 60 Hz, whose line rate computes as 31.5 kHz rather than the
+15.75 it runs. A tool deciding whether a mode suits a 15 kHz CRT will rule out
+the modes it most wants — Switchres answered a 640x480 request with 240 lines,
+half of them discarded, before this was addressed.
+
+So the driver writes down what it is really running:
+
+```
+C:\ProgramData\gud-windows\modes.active
+```
+
+Same spelling as the INI it reads, so one parser covers both. It is a generated
+file, rewritten on every store rebuild, and it is a **published interface** —
+`switchres`' GUD backend reads it — so the format is not free to churn:
+
+```
+; gud-windows active mode list -- generated, do not edit.
+; The interlace flag here is authoritative. Windows reports
+; every one of these modes as progressive.
+; device = USB\VID_1D50&PID_614D&REV_0100
+[modelines]
+ModeLine "648x480i60" 12.600 648 670 730 800 480 486 492 525 interlace -hsync -vsync
+```
+
+The `device` line carries the hardware id, from
+`WdfDeviceQueryProperty(DevicePropertyHardwareID)`. `EnumDisplayDevices` reports
+the same string as the display adapter's `DeviceID`, so a reader can confirm the
+list describes the display it is looking at rather than some other USB-attached
+one on the same machine. A reader that skips that check can end up claiming a
+DisplayLink adapter.
 
 ## The frame loop
 
@@ -234,21 +322,31 @@ against the 16-step greyscale ramp on the test card.
 
 ## EDID
 
-None sent.
+A minimal one, carrying no timing at all.
 
-The reference device implements one and deliberately does not send it: tested on
-hardware, a host given that EDID picks a mode wider than the raster and drops
-frames — with a bare name descriptor as much as with sync range limits. Both
-variants lack any timing descriptor, which is the likely cause and is not yet
-settled.
+The device's own EDID is not passed on. The reference device implements one and
+deliberately does not send it: tested on hardware, a host given that EDID picks a
+mode wider than the raster and drops frames — with a bare name descriptor as much
+as with sync range limits.
 
-Windows is less tolerant of a monitor with no EDID than Linux is; the display
-shows as a generic PnP monitor. A wrong mode on a fixed-frequency deflection
-circuit is worse than an unhelpful name.
+Sending none at all is not available on Windows. `IddCxMonitorCreate` refuses a
+description of type `UNINITIALIZED`, and the header comment saying to pass NULL
+is stale — the field is a struct by value, so there is no NULL to pass. A monitor
+has to have a description, and a monitor with no modes cannot arrive.
 
-If a name turns out to be needed, build a block carrying a *timing* descriptor
-for the preferred mode rather than range limits. That is the untried variant and
-the one the evidence points at.
+So the driver builds a 128-byte block with a name descriptor, three unused
+descriptors and a computed checksum: no detailed timing descriptors, no
+established timings, no standard timings. Windows can derive no modes from it,
+so it asks `EvtIddCxParseMonitorDescription` instead, and the answer is the
+modeline store — the only thing that knows the porches.
+
+That is the property worth protecting. An EDID with timings in it would put modes
+in front of Windows that the store has never heard of, and
+`EvtIddCxAdapterCommitModes` would rightly refuse them, which is a display
+listing modes it cannot set.
+
+The display shows as a generic PnP monitor as a result. A wrong mode on a
+fixed-frequency deflection circuit is worse than an unhelpful name.
 
 ### Not a pass-through either
 
@@ -263,13 +361,13 @@ working. The result is a display whose modes are listed and cannot be selected,
 and that happens on any device whose EDID describes timing its own mode list does
 not.
 
-So no EDID, for every device. If one turns out not to work without an EDID that
-is a runtime option and not a new default, and it can go in the `modelines.ini`
-the store already reads:
+So the device's EDID is not passed on, for any device. If one turns out to need
+it, that is a runtime option and not a new default, and it can go in the
+`modelines.ini` the store already reads:
 
 ```
 [options]
-edid = passthrough        ; default: none
+edid = passthrough        ; default: the driver's own, no timing
 ```
 
 Reconciling the EDID's modes against the store is the work. The switch is not.
@@ -283,6 +381,16 @@ natural place to surface them anyway.
 **More than one connector.** `GET_CONNECTORS` returns an array and this takes
 the first. A second would need a second IddCx monitor with its own swapchain.
 Not difficult; no GUD device in existence reports more than one.
+
+**More than one GUD device on a machine.** Assumed against throughout, and the
+assumption has spread rather than stayed put. `EvtIddCxParseMonitorDescription`
+is handed a description and a mode buffer and nothing else — no monitor, no
+adapter, no device — so the store is reached through a file-scope pointer, and
+the lock guarding it is file-scope for the same reason. `MonitorContainerId` is
+a fixed constant because it has to be stable across reboots, so two devices
+would report the same one. `modes.active` and `modelines.ini` are single files
+at fixed paths. Undoing this means a device-keyed lookup for that callback, and
+a container ID derived from the device's serial.
 
 **Sub-byte formats.** `R1` and `XRGB1111` have no byte-per-pixel and every
 buffer-size calculation here assumes one. They exist for e-paper and tiny

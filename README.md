@@ -1,10 +1,10 @@
 # gud-windows — WIP
 
-**The wire is proved on hardware. The driver is not.** `gudprobe` enumerates a
-real device, sets modes and puts pixels on a CRT, including timings the device
-never advertised. The IddCx driver builds, installs, loads and runs its own code
-in the UMDF host, and stops one call short of a picture. Read *Status* before
-trusting any of it.
+**It works, and it is early.** A Generic USB Display appears in Display
+Settings, the desktop extends onto a 15 kHz CRT, and Switchres generates a
+per-game modeline that reaches the board with its own porches — the thing the
+project exists to do. What it has not had is mileage: one device, one machine,
+one pair of eyes. Read *Status* before trusting any of it.
 
 ---
 
@@ -97,6 +97,19 @@ nowhere a Windows Switchres leaves a modeline to be found: the existing backends
 interface and leave nothing behind. Writing to a known destination is the shape
 `drmkms` already has, so the backend is small.
 
+The file is watched, so a modeline added while the display is running takes
+effect without a replug — the store is rebuilt and the monitor re-enumerated
+when the set of modes changes. IddCx reads a monitor's mode list once, at
+arrival, so a new geometry costs a departure and an arrival; there is no way
+around that and `docs/DESIGN.md` explains what was tried.
+
+The driver also writes back. `C:\ProgramData\gud-windows\modes.active` holds
+what it is currently running, in the same spelling, because nothing outside the
+driver can otherwise learn what these modes really are — Windows reports every
+one of them as progressive, so a 480i timing reads as 31.5 kHz rather than
+15.75 and a 15 kHz tool discards exactly the modes it wants. It is a generated
+file and a published interface; the Switchres backend reads it.
+
 The lookup key is exact — pixel clock, both totals, active size, interlace — not
 a refresh-rate match. `DISPLAYCONFIG_VIDEO_SIGNAL_INFO` hands those numbers
 straight back because the driver put them there. Matching on refresh alone
@@ -108,56 +121,58 @@ fixed-frequency deflection circuit.
 
 ## Status
 
-Worst first.
+Most proved first, and the caveats are in each section rather than collected
+here.
 
-### In progress — the driver initialises, no monitor yet
+### Works — the desktop is on the CRT, at per-game modelines
 
-Every call from load to adapter registration now succeeds on hardware. The
-driver's own log:
+The whole path runs end to end on hardware. Windows names a mode, the driver
+finds the modeline behind it, and the real porches go on the wire:
 
 ```
-DriverEntry: WdfDriverCreate            -> 0x00000000
-EvtDriverDeviceAdd: IddCxDeviceInitConfig -> 0x00000000
-EvtDriverDeviceAdd: WdfDeviceCreate       -> 0x00000000
-EvtDriverDeviceAdd: IddCxDeviceInitialize -> 0x00000000
-EvtDevicePrepareHardware: entered
-  WdfUsbTargetDeviceCreateWithParameters  -> 0x00000000
-  WdfUsbTargetDeviceSelectConfig          -> 0x00000000
-D0Entry: gud_probe ok. magic=0x1D50614D modes=2 formats=2 fmt=0x40
-D0Entry: ReloadModes -> 0x00000000, store has 2 modes
-D0Entry: IddCxAdapterInitAsync          -> 0x00000000
+CommitModes: entered, 1 paths
+  path active 648x480 pixelRate=12600000 total 800x525
+  modeline 648x480i60: 648x480i clk=12600 h 648/670/730/800 v 480/486/492/525
+  gud_set_state -> 0
+AssignSwapChain: streaming 648x480
 ```
 
-The device reaches **`status=OK`, `problem=0`** — no fault, nothing for Windows
-to complain about. The driver speaks GUD to the device over WDF-USB, builds its
-modeline store from what the device advertises, and registers an IddCx adapter
-against a USB PDO.
+A monitor appears in Display Settings, is selectable, and the desktop extends
+onto it. Both of the reference device's modes work — 648x480i60 and 632x240p60
+— each committed from the store with its own timing.
 
-**No monitor appears, because `EvtIddCxAdapterInitFinished` is never called.**
+**Modelines can be added while the display is running.** The driver watches
+`modelines.ini` and picks up a new one within about two seconds, then
+re-enumerates its monitor so Windows offers the new geometry. No replug, no
+device restart. That is what makes a per-game modeline workable rather than a
+configuration step.
 
-That is established rather than assumed. The callback logs on its first line,
-before dereferencing anything, so a context that was not attached would fault
-*after* the line was written. Nothing appears. IddCx accepts the adapter,
-returns success, and never completes the second half of the two-stage creation
-the `IddCx Objects` documentation describes — so `IddCxMonitorCreate` and
-`IddCxMonitorArrival`, which live in that callback, never run.
+**A Switchres backend exists**, on the `gud-backend` branch of
+[alphanu1/switchres](https://github.com/alphanu1/switchres). It generates a
+timing for the game, writes it here, waits for the re-enumeration and selects
+it. Verified against a 15 kHz CRT with `384x224@59.185` and an interlaced
+`640x480@60`, neither of which the device advertises:
 
-Not the cause, each eliminated: the callback is registered in
-`IDD_CX_CLIENT_CONFIG` alongside the six that IddCx already accepted, the caps
-now match the `IndirectDisplay` sample field for field (both version pointers
-included, which was a real fix), and the adapter object comes back valid with
-its `ObjectAttributes` context type attached.
+```
+Switchres: normal (384x224@59.185001)->(384x224@59.185001)
+GUD: mode 384x224 appeared after 3750 ms
+set_desktop_mode: \\.\DISPLAY68 (384x224@59)
+    -> modeline sr_0: 384x224p clk=7842 h 384/400/437/500 v 224/236/239/265
+```
 
-What has *not* been tried, and is the obvious next move: `BRINGUP.md` step 4's
-minimal root-enumerated driver. Every difference from the working sample is now
-narrowed to the device being USB-backed rather than root-enumerated, and that
-driver isolates exactly that in one run. It was the right first step and
-skipping it has now cost twice.
+That is the thing this project was written to do.
+
+**One surprise worth reading before touching any of it:** interlace does not
+survive IddCx. A mode set as interlaced comes back progressive, both at commit
+time and to every application — `EnumDisplaySettings` reports no `DM_INTERLACED`
+for a 480i mode. It has caught two different pieces of code already. The driver
+publishes `C:\ProgramData\gud-windows\modes.active` with the real timings for
+anything that needs to reason about line rate; `docs/DESIGN.md` has the detail.
 
 ### Fixed, and worth not repeating
 
-Six blockers, none of which a compiler can see and none of which the failure
-names. In the order they were hit:
+Eight blockers, none of which a compiler can see and none of which the failure
+names. The last two were the expensive ones. In the order they were hit:
 
 1. **`EvtIddCxParseMonitorDescription` is mandatory.** Without it
    `IddCxDeviceInitConfig` fails `STATUS_INVALID_PARAMETER`. A driver with no
@@ -181,6 +196,33 @@ names. In the order they were hit:
    are not optional.** Null, and `IddCxAdapterInitAsync` refuses the caps
    without saying which field. Point both at one `IDDCX_ENDPOINT_VERSION` with
    `Size` and `MajorVer` set, as the `IndirectDisplay` sample does.
+7. **An IddCx driver needs the `IndirectKmd` upper filter in its INF.**
+   `HKR,,"UpperFilters",0x00010000,"IndirectKmd"` in an `.NT.HW` section.
+   `IndirectKmd.sys` is the kernel half of the indirect display model, the piece
+   that joins the device to `dxgkrnl`. Without it `IddCxAdapterInitAsync`
+   returns success and the OS has no path to call back on:
+   `EvtIddCxAdapterInitFinished` is never invoked, the device sits at
+   `status=OK` `problem=0`, and no monitor appears. It is declared in
+   `rdpidd.inf` and **absent from the `IndirectDisplay` sample's INF**, which is
+   why building from the sample cannot get you there. Seven hypotheses were
+   eliminated ahead of it — dispatcher, caps, callback ordering, `ClassVer`,
+   host process sharing, test signing, the callback it is called from — and none
+   of them were wrong; the plumbing they depended on was absent.
+8. **`AdditionalSignalInfo.videoStandard` must not be zero.** Zero is what
+   zero-initialising the signal info leaves, and it is enough for
+   `IddCxMonitorArrival` to refuse the mode list with `STATUS_INVALID_PARAMETER`
+   and name no field — while `IddCxMonitorCreate` accepts the same monitor
+   happily. 255, "other", is the honest value: there is no D3DKMDT video
+   standard for a 15 kHz arcade raster. `vSyncFreqDivider` goes with it, 1 on
+   target modes and 0 on monitor modes; the header describes both structures in
+   one comment and so appears to contradict itself.
+
+**And one that is not a driver bug but cost more than several of them.**
+`DriverVer` has to increase or Windows keeps the installed binary and does not
+say it has declined. Several rounds of testing here measured an older build,
+including the first run of a fix that worked. Any driver iteration loop needs a
+check that the installed binary is the one just built — without it a negative
+result means nothing.
 
 Also fixed: all four originally-listed semantic bugs. The context lookup in
 every callback goes through `AdapterContext`/`MonitorContext` back-pointers
@@ -203,7 +245,11 @@ touching a UMDF driver again:
   what three without it had not, and every blocker after that came out in one
   or two cycles rather than six.
 
-### Compiled against stubs — the driver
+### The stub build, which is now a lint rather than the only check
+
+The driver builds against the real WDK and runs, so this is no longer what
+stands between the code and reality. It is kept because it is fast, needs no
+WDK, and catches a class of fault the WDK build does not.
 
 Both translation units build to objects under `-Wall -Wextra -Wshadow
 -Wcast-qual -Wconversion`, no warnings. `IddCx.h` and `wdf.h` are stubbed in
@@ -232,7 +278,7 @@ metadata shape. A syntax pass proves the code is self-consistent, not correct.
 
 `UmdfExtensions` and `UmdfLibraryVersion` no longer need copying from anywhere.
 `IddCx0102` is right; `UmdfLibraryVersion` must be **2.31.0** on Windows 10 —
-see *Blocked* above.
+blocker 2 above.
 
 ### Runs on hardware — `gudprobe.exe`
 
@@ -374,34 +420,36 @@ The driver needs the WDK and the two version lines in `GudDisplay.inf` fixed.
 
 `docs/BRINGUP.md` has the detail.
 
-Steps 1 to 3 are **done**. The wire is proved: WinUSB bound from a signed INF,
+Steps 1 to 6 are **done**. The wire is proved: WinUSB bound from a signed INF,
 enumeration byte-identical to `docs/expected-gudprobe-output.txt`, test card,
 an unadvertised 384x224p60 modeline accepted and scanned out, and 600 damage
-rects with no drift.
+rects with no drift. The driver loads on a USB PDO, brings up a monitor, puts
+the desktop on the CRT, takes modelines from outside while running, and a
+Switchres backend drives it.
 
-Step 4 is **half answered**. IddCx does attach to a USB PDO it did not create:
-`IddCxDeviceInitConfig` and `IddCxDeviceInitialize` both return success on one,
-and Microsoft's indirect-display overview lists a USB dongle with a monitor
-attached as a scenario the model exists for. So the one-package design stands.
-What is not settled is whether that same device object can also be a USB target
-— see *Blocked*.
+What is left, in order:
 
-1. Settle the USB question, with the two experiments in *Blocked*. Do the
-   minimal root-enumerated driver first; it is what step 4 asked for and
-   skipping it is why the variables are tangled.
-2. First frame. `kFullFrameOnly` in `Driver.h` sends the whole surface every
-   frame and skips damage entirely — 1.6 ms of a 16.7 ms field on measured
-   hardware, so it is affordable, and it takes every rect-arithmetic fault off
-   the table while the IddCx side is still unproven. Turn it off afterwards.
-3. Fix the modeline store's dedup: `modeline_store_add()` keys on geometry and
-   refresh within 20 mHz, so two per-game modelines at one geometry less than
-   about 3 kHz of pixel clock apart silently replace each other.
+1. **Turn `kFullFrameOnly` off.** It is in `Driver.h` and sends the whole
+   surface every frame, skipping damage entirely — 1.6 ms of a 16.7 ms field on
+   measured hardware, so it is affordable, and it took every rect-arithmetic
+   fault off the table while the IddCx side was unproven. That justification has
+   expired: there is a stable picture to compare against now, and the damage
+   path measured 0.83 ms for 600 rects on this hardware and is not exercised.
+2. **Fix the modeline store's dedup.** `modeline_store_add()` keys on geometry
+   and refresh within 20 mHz, so two per-game modelines at one geometry less
+   than about 3 kHz of pixel clock apart silently replace each other.
    `modeline_store_find_exact()` can already tell them apart; only the insert
-   cannot. This bites a Switchres backend directly.
-4. A Switchres backend writing into the modeline store.
-
-Worth doing on the device side at some point, unchanged: Microsoft OS 2.0
-descriptors on the gadget remove the WinUSB binding step entirely.
+   cannot. This bites the Switchres backend directly, and now that the backend
+   exists it is reachable rather than theoretical.
+3. **Replace the deferred monitor arrival.** It is a `std::thread` with a
+   two-second sleep, left over from a hypothesis that proved wrong. `StartModeWatch`
+   demonstrates a working WDF timer in the same driver, so there is no longer an
+   excuse for it.
+4. **Revisit `MonitorType` and the security descriptor.** `MonitorType` is
+   `HDMI`, which was a diagnostic value; `INDIRECT_WIRED` is probably the honest
+   one. `D:P(A;;GA;;;WD)` is `rdpidd.inf`'s verbatim and grants generic-all to
+   Everyone — it is there because it is the known-working configuration, not
+   because it has been reasoned about.
 
 Worth doing on the device side at some point: Microsoft OS 2.0 descriptors on
 the gadget remove step 1 entirely. Windows binds WinUSB from a WCID descriptor
