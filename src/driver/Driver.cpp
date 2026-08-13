@@ -559,6 +559,73 @@ static NTSTATUS EvtDevicePrepareHardware(WDFDEVICE device, WDFCMRESLIST, WDFCMRE
     return status;
 }
 
+// Adapter creation runs here, not in EvtDeviceD0Entry.
+//
+// "The IDDCX_ADAPTER should only be created once all the PnP devices that make
+// up the indirect display solution are successfully started" -- and D0Entry
+// runs *during* the start transition, not after it. EvtDeviceSelfManagedIoInit
+// is the WDF callback that means the device has started and is ready for I/O,
+// which is the state that sentence is describing.
+//
+// The IndirectDisplay sample initialises from D0Entry and works, but it is
+// root-enumerated: a software device with no hardware behind it has no real
+// start sequence to be in the middle of. A USB PDO does. The symptom here was
+// IddCxAdapterInitAsync returning STATUS_SUCCESS and EvtIddCxAdapterInitFinished
+// never being called -- IddCx accepting the adapter and never completing the
+// second half of the two-stage creation.
+_Use_decl_annotations_
+static NTSTATUS EvtDeviceSelfManagedIoInit(WDFDEVICE device)
+{
+    auto* ctx = DeviceGetContext(device);
+    GudLog("SelfManagedIoInit: entered");
+
+    if (ctx->Adapter) {
+        GudLog("SelfManagedIoInit: adapter already exists, nothing to do");
+        return STATUS_SUCCESS;
+    }
+
+    IDARG_IN_ADAPTER_INIT init{};
+    init.WdfDevice = device;
+
+    IDDCX_ADAPTER_CAPS caps{};
+    caps.Size = sizeof(caps);
+    caps.MaxMonitorsSupported = 1;
+    caps.MaxDisplayPipelineRate =
+        (UINT64)ctx->Gud.desc.max_width * ctx->Gud.desc.max_height * 60;
+
+    caps.EndPointDiagnostics.Size = sizeof(caps.EndPointDiagnostics);
+    caps.EndPointDiagnostics.GammaSupport = IDDCX_FEATURE_IMPLEMENTATION_NONE;
+    caps.EndPointDiagnostics.TransmissionType =
+        IDDCX_TRANSMISSION_TYPE_WIRED_USB;
+    caps.EndPointDiagnostics.pEndPointFriendlyName     = L"GUD display";
+    caps.EndPointDiagnostics.pEndPointManufacturerName = L"Generic USB Display";
+    caps.EndPointDiagnostics.pEndPointModelName        = L"blitsCRT";
+
+    static IDDCX_ENDPOINT_VERSION version{};
+    version.Size     = sizeof(version);
+    version.MajorVer = 1;
+    caps.EndPointDiagnostics.pFirmwareVersion = &version;
+    caps.EndPointDiagnostics.pHardwareVersion = &version;
+
+    init.pCaps = &caps;
+
+    WDF_OBJECT_ATTRIBUTES adapterAttrs;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&adapterAttrs, AdapterContext);
+    init.ObjectAttributes = &adapterAttrs;
+
+    IDARG_OUT_ADAPTER_INIT out{};
+    GudLog("SelfManagedIoInit: IddCxAdapterInitAsync...");
+    NTSTATUS status = IddCxAdapterInitAsync(&init, &out);
+    GudLog("SelfManagedIoInit: IddCxAdapterInitAsync -> 0x%08X", (unsigned)status);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    AdapterGetContext(out.AdapterObject)->Device = ctx;
+    ctx->Adapter = out.AdapterObject;
+    GudLog("SelfManagedIoInit: adapter context wired, waiting for InitFinished");
+    return STATUS_SUCCESS;
+}
+
 _Use_decl_annotations_
 static NTSTATUS EvtDeviceD0Entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE)
 {
@@ -594,72 +661,10 @@ static NTSTATUS EvtDeviceD0Entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE)
     if (!NT_SUCCESS(status))
         return status;
 
-    // Guard against a second adapter on resume. EvtDeviceD0Entry fires on
-    // every power transition, and IddCxAdapterInitAsync is not idempotent.
-    // The IndirectDisplay sample initialises here too, so the placement is
-    // kept and the re-entry is refused instead.
-    if (ctx->Adapter)
-        return STATUS_SUCCESS;
-
-    IDARG_IN_ADAPTER_INIT init{};
-    init.WdfDevice = device;
-    init.pCaps = nullptr;   // see below
-
-    IDDCX_ADAPTER_CAPS caps{};
-    caps.Size = sizeof(caps);
-    caps.MaxMonitorsSupported = 1;
-
-    // Not required -- the IndirectDisplay sample leaves this zero and works --
-    // but it is free to state truthfully, and it tracks the hardware rather
-    // than a constant: the descriptor's maximum raster at 60 Hz.
-    caps.MaxDisplayPipelineRate =
-        (UINT64)ctx->Gud.desc.max_width * ctx->Gud.desc.max_height * 60;
-
-    caps.EndPointDiagnostics.Size = sizeof(caps.EndPointDiagnostics);
-    caps.EndPointDiagnostics.GammaSupport = IDDCX_FEATURE_IMPLEMENTATION_NONE;
-
-    // WIRED_USB, not OTHER. It is what this is, and the enumeration has a value
-    // for it -- OTHER is 0xFFFFFFFF and exists for links that do not fit.
-    caps.EndPointDiagnostics.TransmissionType =
-        IDDCX_TRANSMISSION_TYPE_WIRED_USB;
-
-    caps.EndPointDiagnostics.pEndPointFriendlyName     = L"GUD display";
-    caps.EndPointDiagnostics.pEndPointManufacturerName = L"Generic USB Display";
-    caps.EndPointDiagnostics.pEndPointModelName        = L"blitsCRT";
-
-    // pFirmwareVersion and pHardwareVersion are not optional. Left null,
-    // IddCxAdapterInitAsync refuses the caps with STATUS_INVALID_PARAMETER and
-    // says nothing about which field it objected to. The IndirectDisplay sample
-    // points both at one IDDCX_ENDPOINT_VERSION with only Size and MajorVer
-    // filled in, which is what this does -- GUD carries no firmware or hardware
-    // revision, so there is nothing truthful to put in the other fields.
-    //
-    // Must outlive the call. IddCxAdapterInitAsync is asynchronous by name and
-    // reads the caps before returning, but a local here would be a stack
-    // address handed to the framework either way.
-    static IDDCX_ENDPOINT_VERSION version{};
-    version.Size     = sizeof(version);
-    version.MajorVer = 1;
-    caps.EndPointDiagnostics.pFirmwareVersion = &version;
-    caps.EndPointDiagnostics.pHardwareVersion = &version;
-
-    init.pCaps = &caps;
-
-    // The adapter carries a back-pointer to us, so EvtIddCxAdapterInitFinished
-    // and EvtIddCxAdapterCommitModes can find the device context.
-    WDF_OBJECT_ATTRIBUTES adapterAttrs;
-    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&adapterAttrs, AdapterContext);
-    init.ObjectAttributes = &adapterAttrs;
-
-    IDARG_OUT_ADAPTER_INIT out{};
-    GudLog("D0Entry: IddCxAdapterInitAsync...");
-    status = IddCxAdapterInitAsync(&init, &out);
-    GudLog("D0Entry: IddCxAdapterInitAsync -> 0x%08X", (unsigned)status);
-    if (!NT_SUCCESS(status))
-        return status;
-
-    AdapterGetContext(out.AdapterObject)->Device = ctx;
-    ctx->Adapter = out.AdapterObject;
+    // Adapter creation is NOT here -- it moved to EvtDeviceSelfManagedIoInit,
+    // which runs once the device has actually started. D0Entry only brings the
+    // device up and reads its mode list.
+    GudLog("D0Entry: done, adapter deferred to SelfManagedIoInit");
     return STATUS_SUCCESS;
 }
 
@@ -699,8 +704,9 @@ static NTSTATUS EvtDriverDeviceAdd(WDFDRIVER, PWDFDEVICE_INIT deviceInit)
 
     WDF_PNPPOWER_EVENT_CALLBACKS power;
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&power);
-    power.EvtDevicePrepareHardware = EvtDevicePrepareHardware;
-    power.EvtDeviceD0Entry         = EvtDeviceD0Entry;
+    power.EvtDevicePrepareHardware   = EvtDevicePrepareHardware;
+    power.EvtDeviceD0Entry           = EvtDeviceD0Entry;
+    power.EvtDeviceSelfManagedIoInit = EvtDeviceSelfManagedIoInit;
     WdfDeviceInitSetPnpPowerEventCallbacks(deviceInit, &power);
 
     WDF_OBJECT_ATTRIBUTES attrs;

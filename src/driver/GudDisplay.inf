@@ -28,6 +28,10 @@
 Signature   = "$WINDOWS NT$"
 Class       = Display
 ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+; ClassVer 2.0, as Microsoft's own IddCx drivers on this machine declare
+; (rdpidd.inf). Absent, the device installs under the Display class without
+; announcing which display driver model it belongs to.
+ClassVer    = 2.0
 Provider    = %Provider%
 CatalogFile = GudDisplay.cat
 ; Must outrank GudProbeWinUsb.inf, which matches the same hardware ID. With an
@@ -119,6 +123,17 @@ UmdfServiceOrder         = GudDisplay
 UmdfKernelModeClientPolicy = AllowKernelModeClients
 UmdfFileObjectPolicy     = AllowNullAndUnknownFileObjects
 UmdfDeviceObjectPolicy   = AllowNullAndUnknownFileObjects
+
+; Its own host process, as rdpidd.inf and every IddCx driver Microsoft ships
+; declares. Without this the driver is pooled into a shared WUDFHost with
+; whatever else is going -- on this machine it landed in one already serving a
+; Synaptics device, visible in the UMDF operational log handling PnP for
+; SWD\DRIVERENUM\...SYNAUTILAPP and USB\VID_06CB alongside ours.
+;
+; An indirect display driver owns a graphics adapter and a frame thread; it is
+; not something to share a process with an unrelated device.
+UmdfHostProcessSharing   = ProcessSharingDisabled
+UmdfImpersonationLevel   = Identification
 
 [GudDisplay_Install_Service]
 ; 2.31, not 2.33. The WDK ships headers and stubs for both, so 2.33 builds and
