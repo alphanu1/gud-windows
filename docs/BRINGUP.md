@@ -346,6 +346,22 @@ surviving IddCx — see DESIGN.md:
   `DM_INTERLACED`, because Windows has no interlaced mode to match it against.
   Interlace has to be left out of the mode set, and stays in the modeline.
 
+## 7. Synchronise to the raster
+
+Not started. The device is gaining a vertical blanking signal the host can lock
+to, and `VBLANK.md` works through the shape of it: what the device already
+exposes, the four ways of getting the signal across USB, mapping the device's
+clock onto QPC without drifting, and what to do when a full surface does not fit
+in one blanking interval.
+
+It has its own milestones, because it is not one step. The first is small and
+worth doing early: extend the status read the device already performs after
+every `SET_BUFFER` to carry a field counter and a timestamp. That costs nothing
+on the wire and is enough to build and check the whole clock model against.
+
+**Proved when:** a full-screen flicker test on a 240p mode shows no tear line,
+and the device reports no underrun while it runs.
+
 ---
 
 ## Things that will waste time if you do not know them

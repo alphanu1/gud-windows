@@ -293,6 +293,14 @@ the whole surface damaged every frame — the case damage exists to rescue —
 pixels per frame respectively. Twice the pixels, same rate, so the full-frame
 case is the headroom rather than the operating point.
 
+**Nothing here is synchronised to the raster yet.** The device is not double
+buffered — damage goes straight into the memory the scanout is reading — so a
+write that lands while the beam is over that region tears, and the frame loop
+currently sends whenever the OS hands it a frame. That it mostly looks right is
+because desktop damage is usually small and static, which is not the case this
+project exists for. `VBLANK.md` works through the fix; it is designed and not
+yet built.
+
 ## Compression
 
 LZ4 block format, carried here rather than linked. The same reasoning as the

@@ -427,6 +427,7 @@ examples/            a modeline store, every entry checked against the device
 docs/
   DESIGN.md          how it fits together and why it is shaped this way
   BRINGUP.md         the order to do it in, and what to prove at each step
+  VBLANK.md          synchronising to the raster. Designed, not yet built
   expected-gudprobe-output.txt
 ```
 
@@ -508,6 +509,15 @@ What is left, worst first:
 6. **No CI.** The tests, the mingw stub build and `gudprobe` would all run on a
    stock runner; the driver needs the WDK and pinned UMDF 2.31, which is the
    part that needs a real runner to settle.
+
+**Next milestone: vertical blanking.** The device is gaining a vblank the host
+can synchronise to, and the host side is designed but not written —
+`docs/VBLANK.md` has the shape of it. It matters more here than on an ordinary
+display because the device is not double buffered: damage goes straight into the
+memory the raster is reading, so a write that lands mid-scanout tears, and
+nothing currently stops one. The budget is tight — blanking is about 1.4 ms and
+a single damage rectangle costs 0.83 ms of it — and IddCx has no vblank API
+whatsoever, so all of it has to happen inside this driver.
 
 Worth doing on the device side at some point: Microsoft OS 2.0 descriptors on
 the gadget remove step 1 of the bring-up entirely. Windows binds WinUSB from a
