@@ -128,12 +128,31 @@ D0Entry: ReloadModes -> 0x00000000, store has 2 modes
 D0Entry: IddCxAdapterInitAsync          -> 0x00000000
 ```
 
-The driver speaks GUD to the device over WDF-USB, builds its modeline store
-from what the device advertises, and registers an IddCx adapter against a USB
-PDO. **No monitor appears in Display Settings yet.** The next step is
-asynchronous: IddCx calls `EvtIddCxAdapterInitFinished`, which runs
-`IddCxMonitorCreate` and `IddCxMonitorArrival`. That is where to look next, and
-it has a log line in it already.
+The device reaches **`status=OK`, `problem=0`** — no fault, nothing for Windows
+to complain about. The driver speaks GUD to the device over WDF-USB, builds its
+modeline store from what the device advertises, and registers an IddCx adapter
+against a USB PDO.
+
+**No monitor appears, because `EvtIddCxAdapterInitFinished` is never called.**
+
+That is established rather than assumed. The callback logs on its first line,
+before dereferencing anything, so a context that was not attached would fault
+*after* the line was written. Nothing appears. IddCx accepts the adapter,
+returns success, and never completes the second half of the two-stage creation
+the `IddCx Objects` documentation describes — so `IddCxMonitorCreate` and
+`IddCxMonitorArrival`, which live in that callback, never run.
+
+Not the cause, each eliminated: the callback is registered in
+`IDD_CX_CLIENT_CONFIG` alongside the six that IddCx already accepted, the caps
+now match the `IndirectDisplay` sample field for field (both version pointers
+included, which was a real fix), and the adapter object comes back valid with
+its `ObjectAttributes` context type attached.
+
+What has *not* been tried, and is the obvious next move: `BRINGUP.md` step 4's
+minimal root-enumerated driver. Every difference from the working sample is now
+narrowed to the device being USB-backed rather than root-enumerated, and that
+driver isolates exactly that in one run. It was the right first step and
+skipping it has now cost twice.
 
 ### Fixed, and worth not repeating
 

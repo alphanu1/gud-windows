@@ -300,9 +300,26 @@ _Use_decl_annotations_
 static NTSTATUS EvtIddCxAdapterInitFinished(
     IDDCX_ADAPTER adapter, const IDARG_IN_ADAPTER_INIT_FINISHED* args)
 {
-    auto* ctx = AdapterGetContext(adapter)->Device;
+    // Log before touching anything. The previous version dereferenced the
+    // adapter context on its first line, so a context that was not attached
+    // would fault here and look exactly like the callback never being called
+    // -- no log line either way. Distinguishing those two is the whole point.
+    GudLog("AdapterInitFinished: CALLED. AdapterInitStatus=0x%08X",
+           (unsigned)args->AdapterInitStatus);
+
     if (!NT_SUCCESS(args->AdapterInitStatus))
         return args->AdapterInitStatus;
+
+    auto* actx = AdapterGetContext(adapter);
+    GudLog("AdapterInitFinished: AdapterGetContext -> %p", (void*)actx);
+    if (!actx || !actx->Device) {
+        // IddCxAdapterInitAsync is asynchronous, so this can in principle run
+        // before D0Entry has written the back-pointer. Say so rather than
+        // dereferencing null.
+        GudLog("AdapterInitFinished: adapter context not populated yet");
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    auto* ctx = actx->Device;
 
     // Create the monitor. Connector index 0; see gud_probe().
     IDDCX_MONITOR_INFO info{};
@@ -339,6 +356,7 @@ static NTSTATUS EvtIddCxAdapterInitFinished(
 
     IDARG_OUT_MONITORCREATE created{};
     NTSTATUS status = IddCxMonitorCreate(adapter, &create, &created);
+    GudLog("AdapterInitFinished: IddCxMonitorCreate -> 0x%08X", (unsigned)status);
     if (!NT_SUCCESS(status))
         return status;
 
@@ -347,7 +365,9 @@ static NTSTATUS EvtIddCxAdapterInitFinished(
 
     GudLog("AdapterInitFinished: monitor created, calling arrival");
     IDARG_OUT_MONITORARRIVAL arrival{};
-    return IddCxMonitorArrival(ctx->Monitor, &arrival);
+    NTSTATUS astatus = IddCxMonitorArrival(ctx->Monitor, &arrival);
+    GudLog("AdapterInitFinished: IddCxMonitorArrival -> 0x%08X", (unsigned)astatus);
+    return astatus;
 }
 
 // Parse a monitor description into modes.
@@ -425,6 +445,7 @@ static NTSTATUS EvtIddCxAdapterCommitModes(
     IDDCX_ADAPTER adapter, const IDARG_IN_COMMITMODES* in)
 {
     auto* ctx = AdapterGetContext(adapter)->Device;
+    GudLog("CommitModes: entered, %u paths", in->PathCount);
 
     for (UINT i = 0; i < in->PathCount; i++) {
         const IDDCX_PATH& path = in->pPaths[i];
